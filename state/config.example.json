@@ -1,0 +1,49 @@
+{
+  "repositories": [
+    {
+      "id": "acme-web",
+      "owner": "acme",
+      "repo": "web",
+      "localPath": "/Users/you/code/acme-web",
+      "triageCommand": "codex exec --json --prompt-file {context_file}",
+      "implementCommand": "codex exec --json --prompt-file {context_file}",
+      "enabled": true,
+      "perRepoConcurrency": 1,
+      "slack": {
+        "enabled": true,
+        "channelId": "C0123456789",
+        "transport": "chat_sdk"
+      }
+    }
+  ],
+  "global": {
+    "pollIntervalSeconds": 30,
+    "globalConcurrency": 2,
+    "workspaceDir": ".",
+    "closeIssueOnDone": true,
+    "keepWorktrees": false
+  },
+  "slackApp": {
+    "enabled": true,
+    "botToken": "",
+    "appToken": "",
+    "signingSecret": "",
+    "clientId": "",
+    "clientSecret": "",
+    "botTokenEnv": "SLACK_BOT_TOKEN",
+    "signingSecretEnv": "SLACK_SIGNING_SECRET",
+    "appTokenEnv": "SLACK_APP_TOKEN",
+    "clientIdEnv": "SLACK_CLIENT_ID",
+    "clientSecretEnv": "SLACK_CLIENT_SECRET",
+    "webhookBaseUrl": "https://your-domain.example.com",
+    "appDisplayName": "Issue Hunter",
+    "botDisplayName": "Issue Hunter Bot",
+    "useSocketMode": false
+  },
+  "serviceState": {
+    "running": false,
+    "lastRunAt": "",
+    "lastError": "",
+    "activeTasks": 0
+  }
+}

@@ -1,0 +1,348 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>GitHub Issue Hunter</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="page">
+      <header class="hero">
+        <h1>GitHub Issue Hunter</h1>
+        <p>多仓库自动处理 · Slack 向导配置 · Worktree 隔离执行</p>
+      </header>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2>服务控制</h2>
+          <span id="service-status" class="status-badge">unknown</span>
+        </div>
+        <div class="actions">
+          <button id="btn-start">启动 24x7</button>
+          <button id="btn-stop" class="ghost">停止</button>
+          <button id="btn-run-once" class="ghost">立即轮询一次</button>
+          <button id="btn-refresh" class="ghost">刷新状态</button>
+        </div>
+        <pre id="service-status-json" class="mono-box"></pre>
+      </section>
+
+      <nav class="tab-nav" aria-label="配置分区">
+        <button type="button" class="tab-btn active" data-tab="issue">Issue Hunter</button>
+        <button type="button" class="tab-btn" data-tab="board">Board</button>
+        <button type="button" class="tab-btn" data-tab="slack">Slack</button>
+      </nav>
+
+      <section id="tab-issue" class="tab-content active">
+        <section class="panel">
+          <h2>快速配置说明</h2>
+          <div class="guide-grid">
+            <article class="guide-card">
+              <h3>1) 全局配置</h3>
+              <p>`工作目录` 是 Issue Hunter 的运行根目录，用于保存运行状态和每个 issue 的产物，不是代码仓库目录。</p>
+              <p>`全局并发` 控制“所有仓库总共”同时运行的任务数，建议先用 `1~2`。</p>
+            </article>
+            <article class="guide-card">
+              <h3>2) 仓库配置</h3>
+              <p>只填本地仓库路径。owner/repo 通过 `gh repo view` 自动识别，无需手填。</p>
+              <p>三条 wording 是写回 issue 的固定回复文案，可按团队风格调整。</p>
+            </article>
+            <article class="guide-card">
+              <h3>3) Slack 配置（可选）</h3>
+              <p>最小只需 `Bot Token(xoxb-) + App Token(xapp-)`。</p>
+              <p>未配置 Slack 时，issue 拉取与自动处理仍可独立运行。</p>
+            </article>
+          </div>
+        </section>
+
+        <section class="panel two-col">
+          <div>
+            <h2>全局配置</h2>
+            <form id="global-form" class="form-grid">
+              <label>轮询间隔(秒)
+                <input name="pollIntervalSeconds" type="number" min="5" required />
+                <small class="hint-text">每隔多少秒扫描一次新 issue / 新评论。</small>
+              </label>
+              <label>全局并发
+                <input name="globalConcurrency" type="number" min="1" required />
+                <small class="hint-text">所有仓库总并发上限。达到上限时新任务排队。</small>
+              </label>
+              <label>工作目录
+                <input name="workspaceDir" type="text" required />
+                <small class="hint-text">保存运行状态、产物和日志。建议使用独立目录，例如 `/Users/you/github-issue-hunter`。</small>
+              </label>
+              <label class="checkbox"><input name="closeIssueOnDone" type="checkbox" />完成后自动关闭 issue</label>
+              <label class="checkbox"><input name="keepWorktrees" type="checkbox" />保留 worktree（调试）</label>
+              <button type="submit">保存全局配置</button>
+            </form>
+          </div>
+
+          <div>
+            <h2>仓库配置</h2>
+            <p class="wizard-desc">只需配置本地仓库目录和回复文案。GitHub 操作直接走本机已登录的 `gh` CLI。</p>
+            <p class="wizard-desc">Slack 是可选项，在 Slack Tab 里配置，不影响自动处理流程。</p>
+            <form id="repo-form" class="form-grid repo-form">
+              <input type="hidden" name="id" />
+              <label>Local Path
+                <input name="localPath" type="text" required />
+                <small class="hint-text">目标仓库本地绝对路径，如 `/Users/you/work/FutrixData`。</small>
+              </label>
+              <label>自动识别仓库
+                <div class="inline-form">
+                  <input name="detectedRepo" type="text" readonly placeholder="acme/web" />
+                  <button id="btn-detect-repo" type="button" class="ghost">识别</button>
+                </div>
+                <small class="hint-text">识别后自动生成仓库 ID 并绑定 owner/repo。</small>
+              </label>
+              <label>Triage Wording
+                <input name="triageWording" type="text" value="已经收到，正在分析" required />
+                <small class="hint-text">检测到新 issue 后立即回复的文案。</small>
+              </label>
+              <label>Implement Wording
+                <input name="implementWording" type="text" value="已经确认，正在处理" required />
+                <small class="hint-text">AI 判断需要处理时回复的文案。</small>
+              </label>
+              <label>Ignore Wording
+                <input name="ignoreWording" type="text" value="已经确认，目前没有计划支持" required />
+                <small class="hint-text">AI 判断暂不处理时回复的文案。</small>
+              </label>
+              <label>仓库并发（同一仓库同时处理 issue 数）
+                <input name="perRepoConcurrency" type="number" min="1" value="1" required />
+                <small class="hint-text">1 表示串行处理；2 表示同一仓库最多同时处理 2 个 issue。</small>
+              </label>
+              <label class="checkbox"><input name="enabled" type="checkbox" checked />启用仓库</label>
+              <div class="actions">
+                <button type="submit">保存仓库</button>
+                <button id="btn-reset-repo" type="button" class="ghost">重置表单</button>
+              </div>
+            </form>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h2>仓库列表</h2>
+          <div class="repo-table-wrap">
+            <table id="repo-table">
+              <thead>
+                <tr>
+                  <th>ID</th>
+                  <th>仓库</th>
+                  <th>Local Path</th>
+                  <th>Slack 绑定</th>
+                  <th>状态</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </section>
+      </section>
+
+      <section id="tab-slack" class="tab-content">
+        <section class="panel">
+          <h2>Slack 配置向导</h2>
+          <div class="wizard-overview">
+            <p><strong>最小必填：</strong>Bot Token(`xoxb-`) + App Token(`xapp-`)。</p>
+            <p><strong>推荐模式：</strong>勾选 Socket Mode（本地直连 Slack，无需公网 webhook）。</p>
+            <p><strong>重要：</strong>先把 Bot 邀请进目标频道，再刷新频道列表进行仓库绑定。</p>
+          </div>
+
+          <div class="wizard-step">
+            <div class="wizard-head">
+              <span class="wizard-index">1</span>
+              <h3>创建 Slack App 与 Manifest</h3>
+            </div>
+            <p class="wizard-desc">创建应用并导入预置权限。</p>
+            <ol class="wizard-list">
+              <li>点击“生成 Manifest”</li>
+              <li>点击“打开 Slack 创建 App”（会带上 manifest_json）</li>
+              <li>在 Slack 选择工作区并创建应用</li>
+            </ol>
+            <div class="actions compact">
+              <button id="btn-manifest" class="ghost">生成 Manifest</button>
+              <button id="btn-copy-manifest" class="ghost">复制 Manifest</button>
+              <button id="btn-open-slack" class="ghost">打开 Slack 创建 App</button>
+            </div>
+            <textarea id="manifest-output" class="mono-box" rows="9" readonly></textarea>
+          </div>
+
+          <div class="wizard-step">
+            <div class="wizard-head">
+              <span class="wizard-index">2</span>
+              <h3>保存 Slack 配置（默认仅 2 个 Token）</h3>
+            </div>
+            <p class="wizard-desc">先填 Bot Token + App Token 即可。保存时自动读取 App/Bot 名称。</p>
+            <form id="slack-form" class="form-grid">
+              <label class="checkbox"><input name="enabled" type="checkbox" />启用 Slack/Vercel Chat</label>
+              <label>Bot Token (`xoxb-...`)
+                <input name="botToken" type="password" placeholder="xoxb-..." />
+                <small class="hint-text">位置：Slack App -> OAuth & Permissions -> Bot User OAuth Token</small>
+              </label>
+              <label>App Token (`xapp-...`)
+                <input name="appToken" type="password" placeholder="xapp-..." />
+                <small class="hint-text">位置：Slack App -> Basic Information -> App-Level Tokens</small>
+              </label>
+
+              <details>
+                <summary>高级配置（可选）</summary>
+                <div class="form-grid">
+                  <label>Signing Secret
+                    <input name="signingSecret" type="password" />
+                    <small class="hint-text">仅 HTTP webhook 验签需要；纯 Socket Mode 可留空。位置：Basic Information -> App Credentials</small>
+                  </label>
+                  <label>Client ID
+                    <input name="clientId" type="text" />
+                    <small class="hint-text">仅 OAuth 安装流需要，普通本地使用可留空。</small>
+                  </label>
+                  <label>Client Secret
+                    <input name="clientSecret" type="text" />
+                    <small class="hint-text">与 Client ID 配套使用，仅 OAuth 场景需要。</small>
+                  </label>
+                </div>
+              </details>
+              <label>Webhook Base URL
+                <input name="webhookBaseUrl" type="url" placeholder="https://example.com" />
+                <small id="webhook-base-url-hint" class="hint-text">Socket Mode 关闭时需要填写公网可访问地址；Socket Mode 开启时可留空。</small>
+              </label>
+              <p id="slack-app-name-view" class="hint-text">当前 App/Bot 名称：- / -</p>
+              <label class="checkbox"><input name="useSocketMode" type="checkbox" />Socket Mode</label>
+              <button type="submit">保存 Slack 配置</button>
+            </form>
+          </div>
+
+          <div class="wizard-step">
+            <div class="wizard-head">
+              <span class="wizard-index">3</span>
+              <h3>验证并拉取频道列表</h3>
+            </div>
+            <p class="wizard-desc">先验证 token，再刷新频道列表。</p>
+            <ol class="wizard-list">
+              <li>点击“验证 Token”确认 Bot Token 可用</li>
+              <li>在 Slack 频道执行 `/invite @你的Bot`</li>
+              <li>点击“刷新频道列表”，确认频道出现在下方表格</li>
+            </ol>
+            <div class="actions compact">
+              <button id="btn-auth-test" class="ghost">验证 Token</button>
+              <button id="btn-load-channels" class="ghost">刷新频道列表</button>
+              <span id="channel-count" class="hint-text">0 channels</span>
+              <span id="channel-status" class="hint-text">尚未加载频道</span>
+            </div>
+            <pre id="slack-auth-result" class="mono-box"></pre>
+            <div class="repo-table-wrap">
+              <table id="slack-channel-table">
+                <thead>
+                  <tr>
+                    <th>Channel</th>
+                    <th>ID</th>
+                    <th>类型</th>
+                  </tr>
+                </thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h2>频道绑定仓库</h2>
+          <p class="wizard-desc">先拉取频道列表，再为每个仓库选择 Slack 频道与通知方式。</p>
+          <div class="wizard-overview">
+            <p><strong>Transport 说明：</strong>`chat_sdk` 推荐（Thread 体验更完整）；`slack_sdk` 为直发 API；`none` 表示不发 Slack。</p>
+            <p><strong>通知开关：</strong>仅控制该仓库是否向 Slack 推送，不影响 issue 自动处理主流程。</p>
+          </div>
+          <div class="repo-table-wrap">
+            <table id="binding-table">
+              <thead>
+                <tr>
+                  <th>仓库</th>
+                  <th>频道</th>
+                  <th>Transport</th>
+                  <th>通知开关</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </section>
+      </section>
+
+      <section id="tab-board" class="tab-content">
+        <section class="panel">
+          <div class="panel-head">
+            <h2>Issue 看板</h2>
+            <div class="board-head-actions">
+              <span id="board-count" class="hint-text">处理中 0 | 已完成 0</span>
+              <button id="btn-refresh-board" class="ghost" type="button">刷新看板</button>
+            </div>
+          </div>
+          <p class="wizard-desc">按状态展示 issue：处理中 与 已完成。点击卡片查看完整详情。</p>
+          <div class="board-columns" aria-live="polite">
+            <section class="board-column">
+              <div class="board-column-head">
+                <h3>处理中</h3>
+                <span id="board-processing-count" class="hint-text">0</span>
+              </div>
+              <div id="board-processing-empty" class="board-empty">暂无处理中 issue。</div>
+              <div id="board-processing-cards" class="board-grid"></div>
+            </section>
+            <section class="board-column">
+              <div class="board-column-head">
+                <h3>已完成</h3>
+                <span id="board-completed-count" class="hint-text">0</span>
+              </div>
+              <div id="board-completed-empty" class="board-empty">暂无已完成 issue。</div>
+              <div id="board-completed-cards" class="board-grid"></div>
+            </section>
+          </div>
+        </section>
+      </section>
+    </main>
+
+    <div id="board-detail-modal" class="board-modal hidden" role="dialog" aria-modal="true" aria-labelledby="board-detail-title">
+      <div class="board-modal-card">
+        <header class="board-modal-head">
+          <div class="board-modal-title-wrap">
+            <h3 id="board-detail-title">Issue Detail</h3>
+            <p id="board-detail-meta" class="board-meta"></p>
+          </div>
+          <button id="board-detail-close" class="ghost board-close" type="button" aria-label="关闭">关闭</button>
+        </header>
+        <div class="board-links">
+          <a id="board-detail-issue-link" href="#" target="_blank" rel="noreferrer">打开原始 Issue</a>
+          <a id="board-detail-pr-link" href="#" target="_blank" rel="noreferrer">打开 PR</a>
+        </div>
+
+        <div class="board-detail-layout">
+          <section class="board-detail-block">
+            <h4>原始问题</h4>
+            <p id="board-detail-issue-title" class="board-detail-issue-title">-</p>
+            <div id="board-detail-issue-body" class="board-markdown"></div>
+          </section>
+          <section class="board-detail-block">
+            <h4>讨论过程</h4>
+            <div id="board-detail-discussion" class="board-discussion-list"></div>
+          </section>
+          <section class="board-detail-block board-detail-result">
+            <h4>处理结果</h4>
+            <div class="board-result-item">
+              <h5>Summary</h5>
+              <div id="board-detail-summary" class="board-markdown"></div>
+            </div>
+            <div class="board-result-item">
+              <h5>RootCause</h5>
+              <div id="board-detail-root-cause" class="board-markdown"></div>
+            </div>
+            <div class="board-result-item">
+              <h5>Solution</h5>
+              <div id="board-detail-solution" class="board-markdown"></div>
+            </div>
+          </section>
+        </div>
+      </div>
+    </div>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

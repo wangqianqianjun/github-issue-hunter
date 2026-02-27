@@ -1,0 +1,1351 @@
+import { mkdir, writeFile } from "node:fs/promises";
+import { join, resolve } from "node:path";
+
+import { TaskCoordinator } from "./task-coordinator.js";
+import type { AppConfig, IssueExecutionRecord, RepositoryConfig } from "../types/config.js";
+import { runCommand, type CommandResult } from "../utils/run-command.js";
+
+export interface RuntimeStore {
+  isSeen(issueKey: string): Promise<boolean>;
+  getRecord(issueKey: string): Promise<IssueExecutionRecord | null>;
+  markSeen(issueKey: string): Promise<void>;
+  saveRecord(record: IssueExecutionRecord): Promise<void>;
+  listCompleted(): Promise<IssueExecutionRecord[]>;
+}
+
+export interface GitHubClientLike {
+  listOpenIssues(): Promise<Record<string, unknown>[]>;
+  getIssue(issueNumber: number): Promise<Record<string, unknown>>;
+  listIssueComments(issueNumber: number): Promise<Record<string, unknown>[]>;
+  createIssueComment(issueNumber: number, body: string): Promise<void>;
+  closeIssue(issueNumber: number): Promise<void>;
+  downloadImages?(urls: string[], outputDir: string): Promise<string[]>;
+}
+
+export interface CodexRunnerLike {
+  runTriage(
+    contextFile: string,
+    issueNumber: number,
+    issueTitle: string,
+    workingDirectory?: string,
+    onProgress?: (update: string) => Promise<void> | void,
+    abortSignal?: AbortSignal,
+    resumeSessionId?: string
+  ): Promise<Record<string, unknown>>;
+  runImplementation(
+    contextFile: string,
+    issueNumber: number,
+    issueTitle: string,
+    originalUserMessage: string,
+    workingDirectory?: string,
+    onProgress?: (update: string) => Promise<void> | void,
+    abortSignal?: AbortSignal,
+    resumeSessionId?: string
+  ): Promise<Record<string, unknown>>;
+}
+
+export interface IssueNotifier {
+  postIssueStart(issue: Record<string, unknown>): Promise<string>;
+  postThreadUpdate(threadTs: string, text: string): Promise<void>;
+}
+
+export interface WorkspacePreparation {
+  contextFile: string;
+  worktreePath?: string;
+  worktreeBranch?: string;
+  worktreeCreated?: boolean;
+  cleanup: () => Promise<void>;
+}
+
+type CommandRunner = (
+  command: string,
+  args: string[],
+  options?: { cwd?: string; input?: string }
+) => Promise<CommandResult>;
+
+interface IssueEngineDependencies {
+  getConfig: () => Promise<AppConfig>;
+  runtimeStore: RuntimeStore;
+  githubFactory: (repo: RepositoryConfig) => GitHubClientLike;
+  codexFactory: (repo: RepositoryConfig) => CodexRunnerLike;
+  notifierFactory: (repo: RepositoryConfig) => IssueNotifier | null;
+  externalTaskExecutor?: (task: {
+    repo: RepositoryConfig;
+    issueNumber: number;
+    issueKey: string;
+    triggerType: IssueTaskInput["triggerType"];
+  }) => Promise<void>;
+  prepareWorkspace?: (
+    repo: RepositoryConfig,
+    issue: Record<string, unknown>,
+    comments: Record<string, unknown>[],
+    imageUrls: string[]
+  ) => Promise<WorkspacePreparation>;
+  onThreadRegistered?: (issueKey: string, threadToken: string, repo: RepositoryConfig) => Promise<void> | void;
+  onThreadUnregistered?: (issueKey: string) => Promise<void> | void;
+  writeBoard: (records: IssueExecutionRecord[]) => Promise<void>;
+  writeRegressionCase: (
+    repo: RepositoryConfig,
+    issueNumber: number,
+    issueTitle: string,
+    result: Record<string, unknown>
+  ) => Promise<void>;
+  commandRunner?: CommandRunner;
+}
+
+interface IssueTaskInput {
+  repo: RepositoryConfig;
+  config: AppConfig;
+  github: GitHubClientLike;
+  codex: CodexRunnerLike;
+  notifier: IssueNotifier | null;
+  issueNumber: number;
+  issueKey: string;
+  existingRecord: IssueExecutionRecord | null;
+  triggerType: "new" | "retry_failed" | "new_comment" | "slack_signal" | "manual";
+}
+
+type IssueTriggerType = IssueTaskInput["triggerType"];
+
+export class IssueEngine {
+  private readonly coordinator = new TaskCoordinator();
+  private readonly runningAbortControllers = new Map<string, AbortController>();
+  private readonly threadToIssueKey = new Map<string, string>();
+  private readonly issueKeyToThreadTokens = new Map<string, Set<string>>();
+  private readonly commandRunner: CommandRunner;
+
+  constructor(private readonly deps: IssueEngineDependencies) {
+    this.commandRunner = deps.commandRunner ?? runCommand;
+  }
+
+  activeTasks(): number {
+    return this.coordinator.activeCount();
+  }
+
+  stopByThread(threadToken: string): { stopped: boolean; issueKey: string; message: string } {
+    const aliases = deriveThreadTokenAliases(threadToken);
+    for (const token of aliases) {
+      const issueKey = this.threadToIssueKey.get(token);
+      if (!issueKey) {
+        continue;
+      }
+      const controller = this.runningAbortControllers.get(issueKey);
+      if (!controller) {
+        return {
+          stopped: false,
+          issueKey,
+          message: `Issue ${issueKey} 当前没有可停止的运行中的 Codex 任务。`
+        };
+      }
+      controller.abort();
+      return {
+        stopped: true,
+        issueKey,
+        message: `已停止 issue ${issueKey} 的 Codex 任务。`
+      };
+    }
+
+    return {
+      stopped: false,
+      issueKey: "",
+      message: "当前 thread 没有关联运行中的 issue 任务。"
+    };
+  }
+
+  stopByIssueKey(issueKey: string): boolean {
+    const key = String(issueKey || "").trim();
+    if (!key) {
+      return false;
+    }
+    const controller = this.runningAbortControllers.get(key);
+    if (!controller) {
+      return false;
+    }
+    controller.abort();
+    return true;
+  }
+
+  async runOnce(): Promise<void> {
+    const config = await this.deps.getConfig();
+    const pendingTasks = await this.collectPendingTasks(config);
+    if (!pendingTasks.length) {
+      return;
+    }
+
+    const globalLimiter = createLimiter(Math.max(1, Number(config.global.globalConcurrency || 1)));
+    const repoLimiters = new Map<string, ReturnType<typeof createLimiter>>();
+
+    await Promise.all(
+      pendingTasks.map(async (task) => {
+        let repoLimiter = repoLimiters.get(task.repo.id);
+        if (!repoLimiter) {
+          repoLimiter = createLimiter(Math.max(1, Number(task.repo.perRepoConcurrency || 1)));
+          repoLimiters.set(task.repo.id, repoLimiter);
+        }
+
+        await globalLimiter(async () => {
+          await repoLimiter!(async () => {
+            try {
+              if (this.deps.externalTaskExecutor) {
+                await this.deps.externalTaskExecutor({
+                  repo: task.repo,
+                  issueNumber: task.issueNumber,
+                  issueKey: task.issueKey,
+                  triggerType: task.triggerType
+                });
+              } else {
+                await this.processIssue(task);
+              }
+            } finally {
+              this.coordinator.release(task.issueKey);
+            }
+          });
+        });
+      })
+    );
+  }
+
+  async runSpecificIssue(repoId: string, issueNumber: number, triggerType: IssueTriggerType = "manual"): Promise<void> {
+    const config = await this.deps.getConfig();
+    const repo = config.repositories.find((item) => item.id === repoId && item.enabled);
+    if (!repo) {
+      throw new Error(`Repository ${repoId} not found or disabled`);
+    }
+
+    const issueKey = `${repo.owner}/${repo.repo}#${issueNumber}`;
+    if (!this.coordinator.tryAcquire(issueKey)) {
+      throw new Error(`Issue ${issueKey} is already running`);
+    }
+
+    try {
+      await this.deps.runtimeStore.markSeen(issueKey);
+      const existingRecord = await this.deps.runtimeStore.getRecord(issueKey);
+      const github = this.deps.githubFactory(repo);
+      const codex = this.deps.codexFactory(repo);
+      const notifier = this.deps.notifierFactory(repo);
+      await this.processIssue({
+        repo,
+        config,
+        github,
+        codex,
+        notifier,
+        issueNumber,
+        issueKey,
+        existingRecord,
+        triggerType
+      });
+    } finally {
+      this.coordinator.release(issueKey);
+    }
+  }
+
+  private async collectPendingTasks(config: AppConfig): Promise<IssueTaskInput[]> {
+    const tasks: IssueTaskInput[] = [];
+
+    for (const repo of config.repositories) {
+      if (!repo.enabled) {
+        continue;
+      }
+
+      const github = this.deps.githubFactory(repo);
+      const codex = this.deps.codexFactory(repo);
+      const notifier = this.deps.notifierFactory(repo);
+
+      const issues = await github.listOpenIssues();
+      for (const issueSummary of issues) {
+        if ((issueSummary as { pull_request?: unknown }).pull_request) {
+          continue;
+        }
+
+        const issueNumber = Number(issueSummary.number);
+        if (!Number.isFinite(issueNumber)) {
+          continue;
+        }
+
+        const issueKey = `${repo.owner}/${repo.repo}#${issueNumber}`;
+        const seen = await this.deps.runtimeStore.isSeen(issueKey);
+        const existingRecord = await this.deps.runtimeStore.getRecord(issueKey);
+        const seenWithoutRecord = seen && !existingRecord;
+
+        const retryFailed = seen && shouldRetryFailedRecord(existingRecord);
+        const retrySlackSignal =
+          seen &&
+          hasPendingSlackSignal(existingRecord) &&
+          existingRecord?.state !== "triaging" &&
+          existingRecord?.state !== "scheduled" &&
+          existingRecord?.state !== "implementing";
+
+        let retryNewComment = false;
+        if (
+          seen &&
+          !retryFailed &&
+          !retrySlackSignal &&
+          existingRecord &&
+          (existingRecord.state === "completed" ||
+            existingRecord.state === "ignored" ||
+            existingRecord.state === "failed")
+        ) {
+          const comments = await github.listIssueComments(issueNumber);
+          const latestExternal = findLatestExternalComment(comments);
+          const baseline = Number(existingRecord.lastExternalCommentId || 0);
+          retryNewComment = latestExternal.id > baseline;
+        }
+
+        const shouldSchedule = !seen || seenWithoutRecord || retryFailed || retrySlackSignal || retryNewComment;
+        if (!shouldSchedule || !this.coordinator.tryAcquire(issueKey)) {
+          continue;
+        }
+
+        if (!seen) {
+          await this.deps.runtimeStore.markSeen(issueKey);
+        }
+        tasks.push({
+          repo,
+          config,
+          github,
+          codex,
+          notifier,
+          issueNumber,
+          issueKey,
+          existingRecord,
+          triggerType: (!seen || seenWithoutRecord)
+            ? "new"
+            : retryFailed
+              ? "retry_failed"
+              : retrySlackSignal
+                ? "slack_signal"
+                : "new_comment"
+        });
+      }
+    }
+
+    return tasks;
+  }
+
+  private async processIssue(input: IssueTaskInput): Promise<void> {
+    const issue = await input.github.getIssue(input.issueNumber);
+    const issueTitle = String(issue.title ?? `issue-${input.issueNumber}`);
+    let threadTs = String(input.existingRecord?.threadTs ?? "").trim();
+    const abortController = new AbortController();
+    this.runningAbortControllers.set(input.issueKey, abortController);
+
+    const issueComments = await input.github.listIssueComments(input.issueNumber);
+    const latestExternalComment = findLatestExternalComment(issueComments);
+    const inheritedSlackSignalAt = String(input.existingRecord?.lastSlackSignalAt ?? "").trim();
+    const inheritedSlackSignalText = String(input.existingRecord?.lastSlackSignalText ?? "").trim();
+    const inheritedHandledSlackSignalAt = String(input.existingRecord?.lastHandledSlackSignalAt ?? "").trim();
+    let currentCodexSessionId = String(
+      input.existingRecord?.codexSessionId ??
+      input.existingRecord?.implementSessionId ??
+      input.existingRecord?.triageSessionId ??
+      ""
+    ).trim();
+    const handledSlackSignalAt =
+      input.triggerType === "slack_signal" ? inheritedSlackSignalAt : inheritedHandledSlackSignalAt;
+
+    const contextComments = withSyntheticSignalComments(issueComments, input.triggerType, inheritedSlackSignalText);
+    const implementUserMessage = buildImplementUserMessage(
+      issue,
+      issueComments,
+      input.triggerType,
+      inheritedSlackSignalText
+    );
+
+    const baseRecord = (state: IssueExecutionRecord["state"], patch: Partial<IssueExecutionRecord>): IssueExecutionRecord => ({
+      issueKey: input.issueKey,
+      repoId: input.repo.id,
+      issueNumber: input.issueNumber,
+      state,
+      summary: patch.summary ?? "",
+      prUrl: patch.prUrl ?? "",
+      rootCause: patch.rootCause ?? "",
+      solution: patch.solution ?? "",
+      closedAt: patch.closedAt ?? "",
+      threadTs: patch.threadTs ?? threadTs,
+      lastExternalCommentId: patch.lastExternalCommentId ?? latestExternalComment.id,
+      lastExternalCommentAt: patch.lastExternalCommentAt ?? latestExternalComment.createdAt,
+      lastSlackSignalAt: patch.lastSlackSignalAt ?? inheritedSlackSignalAt,
+      lastHandledSlackSignalAt: patch.lastHandledSlackSignalAt ?? handledSlackSignalAt,
+      lastSlackSignalText: patch.lastSlackSignalText ?? inheritedSlackSignalText,
+      codexSessionId: patch.codexSessionId ?? currentCodexSessionId,
+      triageSessionId: patch.triageSessionId ?? currentCodexSessionId,
+      implementSessionId: patch.implementSessionId ?? currentCodexSessionId,
+      lastTriggerType: patch.lastTriggerType ?? input.triggerType,
+      updatedAt: nowIso()
+    });
+
+    try {
+      await this.createIssueCommentIfNeeded(
+        input.github,
+        input.issueNumber,
+        input.repo.triageWording,
+        issueComments
+      );
+      await this.deps.runtimeStore.saveRecord(baseRecord("triaging", {}));
+
+      const imageUrls = extractImageUrls(issue, issueComments);
+      const workspace = await this.prepareWorkspace(
+        input.repo,
+        issue,
+        contextComments,
+        imageUrls,
+        input.github
+      );
+
+      try {
+        const progressIntervalMs = Math.max(5, Number(process.env.CODEX_PROGRESS_UPDATE_INTERVAL_SECONDS || 20)) * 1000;
+
+        if (input.notifier) {
+          if (!threadTs) {
+            threadTs = await input.notifier.postIssueStart(issue);
+          }
+          this.registerThreadToken(input.issueKey, threadTs);
+          await this.deps.onThreadRegistered?.(input.issueKey, threadTs, input.repo);
+          const startMessage =
+            input.triggerType === "new"
+              ? "Issue 已进入评估阶段，开始 triage。"
+              : input.triggerType === "retry_failed"
+                ? "检测到上次执行失败，开始重试 triage。"
+                : `收到新反馈（${triggerTypeLabel(input.triggerType)}），开始重新 triage。`;
+          await input.notifier.postThreadUpdate(threadTs, startMessage);
+        }
+
+        const triageRelay = createCodexProgressRelay(input.notifier, threadTs, progressIntervalMs);
+        let triage: Record<string, unknown>;
+        try {
+          triage = await input.codex.runTriage(
+            workspace.contextFile,
+            input.issueNumber,
+            issueTitle,
+            workspace.worktreePath,
+            async (update) => {
+              await triageRelay.push(update);
+            },
+            abortController.signal,
+            currentCodexSessionId
+          );
+        } finally {
+          await triageRelay.stop();
+        }
+
+        const needsProcessing = resolveTriageNeedsProcessing(triage);
+        const triageReason = String(triage.reason ?? "").trim();
+        const triageSessionId = String(triage.codex_session_id ?? triage.thread_id ?? "").trim();
+        if (triageSessionId) {
+          currentCodexSessionId = triageSessionId;
+        }
+
+        if (input.notifier && threadTs) {
+          await input.notifier.postThreadUpdate(threadTs, buildTriageThreadMessage(triage));
+          await input.notifier.postThreadUpdate(
+            threadTs,
+            needsProcessing
+              ? "决定：进入开发处理。"
+              : "决定：当前不进入开发处理。"
+          );
+        }
+
+        if (!needsProcessing) {
+          await this.createIssueCommentIfNeeded(
+            input.github,
+            input.issueNumber,
+            buildIgnoreComment(input.repo.ignoreWording, triageReason),
+            issueComments
+          );
+          await this.deps.runtimeStore.saveRecord(
+            baseRecord("ignored", {
+              summary: String(triage.reason ?? ""),
+              codexSessionId: currentCodexSessionId,
+              triageSessionId: currentCodexSessionId,
+              implementSessionId: currentCodexSessionId,
+              threadTs
+            })
+          );
+          return;
+        }
+
+        await this.createIssueCommentIfNeeded(
+          input.github,
+          input.issueNumber,
+          input.repo.implementWording,
+          issueComments
+        );
+        await this.deps.runtimeStore.saveRecord(
+          baseRecord("scheduled", {
+            codexSessionId: currentCodexSessionId,
+            triageSessionId: currentCodexSessionId,
+            implementSessionId: currentCodexSessionId
+          })
+        );
+
+        if (input.notifier && threadTs) {
+          await input.notifier.postThreadUpdate(threadTs, "Issue 已进入处理队列，开始执行修复。");
+        }
+
+        await this.deps.runtimeStore.saveRecord(
+          baseRecord("implementing", {
+            threadTs
+          })
+        );
+
+        const progressRelay = createCodexProgressRelay(
+          input.notifier,
+          threadTs,
+          progressIntervalMs
+        );
+
+        let implement: Record<string, unknown>;
+        try {
+          implement = await input.codex.runImplementation(
+            workspace.contextFile,
+            input.issueNumber,
+            issueTitle,
+            implementUserMessage,
+            workspace.worktreePath,
+            async (update) => {
+              await progressRelay.push(update);
+            },
+            abortController.signal,
+            currentCodexSessionId
+          );
+        } finally {
+          await progressRelay.stop();
+        }
+
+        const normalized = normalizeImplementationResult(implement);
+        normalized.prUrl = await this.ensurePullRequestUrl({
+          repo: input.repo,
+          issueNumber: input.issueNumber,
+          issueTitle,
+          triageReason,
+          workspace,
+          currentPrUrl: normalized.prUrl
+        });
+        const implementSessionId = String(implement.codex_session_id ?? implement.thread_id ?? "").trim();
+        if (implementSessionId) {
+          currentCodexSessionId = implementSessionId;
+        }
+        let completionComments = issueComments;
+        try {
+          completionComments = await input.github.listIssueComments(input.issueNumber);
+        } catch {
+          // Fallback to cached comments when listing comments fails.
+        }
+        await this.createIssueCommentIfNeeded(
+          input.github,
+          input.issueNumber,
+          buildCompletionComment(normalized, triageReason),
+          completionComments
+        );
+
+        if (input.config.global.closeIssueOnDone) {
+          await input.github.closeIssue(input.issueNumber);
+        }
+
+        const completedRecord = baseRecord("completed", {
+          summary: normalized.summary,
+          rootCause: normalized.rootCause,
+          solution: normalized.solution,
+          prUrl: normalized.prUrl,
+          codexSessionId: currentCodexSessionId,
+          triageSessionId: currentCodexSessionId,
+          implementSessionId: currentCodexSessionId,
+          closedAt: nowIso(),
+          threadTs
+        });
+
+        await this.deps.runtimeStore.saveRecord(completedRecord);
+        await this.deps.writeRegressionCase(input.repo, input.issueNumber, issueTitle, normalized);
+        await this.deps.writeBoard(await this.deps.runtimeStore.listCompleted());
+
+        if (input.notifier && threadTs) {
+          await input.notifier.postThreadUpdate(threadTs, `处理完成。PR: ${normalized.prUrl || "未提供"}`);
+        }
+      } finally {
+        await workspace.cleanup();
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const cancelled = isCancellationError(message);
+      await this.deps.runtimeStore.saveRecord(
+        baseRecord("failed", {
+          summary: cancelled ? "Cancelled by Slack thread command" : message,
+          threadTs
+        })
+      );
+      if (input.notifier && threadTs) {
+        await input.notifier.postThreadUpdate(
+          threadTs,
+          cancelled ? "已收到停止指令，当前 Codex 任务已停止。" : `处理失败: ${message}`
+        );
+      }
+    } finally {
+      this.runningAbortControllers.delete(input.issueKey);
+      this.unregisterThreadTokens(input.issueKey);
+      await this.deps.onThreadUnregistered?.(input.issueKey);
+    }
+  }
+
+  private async prepareWorkspace(
+    repo: RepositoryConfig,
+    issue: Record<string, unknown>,
+    comments: Record<string, unknown>[],
+    imageUrls: string[],
+    github: GitHubClientLike
+  ): Promise<WorkspacePreparation> {
+    if (this.deps.prepareWorkspace) {
+      return this.deps.prepareWorkspace(repo, issue, comments, imageUrls);
+    }
+
+    const issueNumber = Number(issue.number);
+    const issueDir = resolve(repo.localPath, ".issue-hunter", String(issueNumber));
+    await mkdir(issueDir, { recursive: true });
+
+    const imagesDir = join(issueDir, "images");
+    let imageFiles: string[] = [];
+    if (github.downloadImages) {
+      imageFiles = await github.downloadImages(imageUrls, imagesDir);
+    }
+
+    const context = {
+      repository: {
+        owner: repo.owner,
+        repo: repo.repo,
+        localPath: repo.localPath
+      },
+      issue,
+      comments,
+      imageUrls,
+      imageFiles
+    };
+
+    const contextFile = join(issueDir, "context.json");
+    await writeFile(contextFile, JSON.stringify(context, null, 2), "utf8");
+
+    return {
+      contextFile,
+      worktreePath: repo.localPath,
+      cleanup: async () => undefined
+    };
+  }
+
+  private registerThreadToken(issueKey: string, token: string): void {
+    const aliases = deriveThreadTokenAliases(token);
+    if (!aliases.length) {
+      return;
+    }
+
+    let tokens = this.issueKeyToThreadTokens.get(issueKey);
+    if (!tokens) {
+      tokens = new Set<string>();
+      this.issueKeyToThreadTokens.set(issueKey, tokens);
+    }
+
+    for (const alias of aliases) {
+      if (!alias) {
+        continue;
+      }
+      tokens.add(alias);
+      this.threadToIssueKey.set(alias, issueKey);
+    }
+  }
+
+  private unregisterThreadTokens(issueKey: string): void {
+    const tokens = this.issueKeyToThreadTokens.get(issueKey);
+    if (!tokens) {
+      return;
+    }
+    for (const token of tokens) {
+      this.threadToIssueKey.delete(token);
+    }
+    this.issueKeyToThreadTokens.delete(issueKey);
+  }
+
+  private async createIssueCommentIfNeeded(
+    github: GitHubClientLike,
+    issueNumber: number,
+    body: string,
+    existingComments: Record<string, unknown>[]
+  ): Promise<boolean> {
+    const finalBody = appendIssueHunterMarker(body);
+    const normalizedBody = normalizeIssueCommentBody(finalBody);
+    if (!normalizedBody) {
+      return false;
+    }
+
+    const duplicated = existingComments.some(
+      (item) => normalizeIssueCommentBody(String(item.body ?? "")) === normalizedBody
+    );
+    if (duplicated) {
+      return false;
+    }
+
+    await github.createIssueComment(issueNumber, finalBody);
+    existingComments.push({ body: finalBody });
+    return true;
+  }
+
+  private async ensurePullRequestUrl(input: {
+    repo: RepositoryConfig;
+    issueNumber: number;
+    issueTitle: string;
+    triageReason: string;
+    workspace: WorkspacePreparation;
+    currentPrUrl: string;
+  }): Promise<string> {
+    const existing = String(input.currentPrUrl || "").trim();
+    if (existing) {
+      return existing;
+    }
+
+    const autoCreated = await this.tryAutoCreatePullRequest(input);
+    if (autoCreated) {
+      return autoCreated;
+    }
+
+    throw new Error(
+      "Implementation completed but no PR URL was produced. Auto PR creation also failed. " +
+        "Please check git changes/worktree and gh auth."
+    );
+  }
+
+  private async tryAutoCreatePullRequest(input: {
+    repo: RepositoryConfig;
+    issueNumber: number;
+    issueTitle: string;
+    triageReason: string;
+    workspace: WorkspacePreparation;
+  }): Promise<string> {
+    const repoName = `${input.repo.owner}/${input.repo.repo}`;
+    const workingDir = String(input.workspace.worktreePath || "").trim() || input.repo.localPath;
+
+    // Safety: only auto-create PR from isolated worktree runs.
+    const worktreeCreated = Boolean(input.workspace.worktreeCreated);
+    if (!worktreeCreated) {
+      return "";
+    }
+
+    const branch = await this.resolveCurrentBranch(workingDir, input.workspace.worktreeBranch);
+    if (!branch || branch === "HEAD") {
+      return "";
+    }
+
+    const existingPrUrl = await this.findOpenPrUrl(repoName, branch, workingDir);
+    if (existingPrUrl) {
+      return existingPrUrl;
+    }
+
+    await this.commitPendingChangesIfAny(workingDir, input.issueNumber, input.issueTitle);
+    await this.pushBranch(workingDir, branch);
+
+    const createdOrExisting = await this.findOpenPrUrl(repoName, branch, workingDir);
+    if (createdOrExisting) {
+      return createdOrExisting;
+    }
+
+    const defaultBranch = await this.resolveDefaultBranch(repoName, workingDir);
+    const aheadCount = await this.countAheadCommits(workingDir, defaultBranch);
+    if (aheadCount <= 0) {
+      return "";
+    }
+
+    const title = buildPrTitle(input.issueNumber, input.issueTitle);
+    const body = buildPrBody(input.issueNumber, input.triageReason);
+    const createResult = await this.exec("gh", [
+      "pr",
+      "create",
+      "--repo",
+      repoName,
+      "--head",
+      branch,
+      "--base",
+      defaultBranch,
+      "--title",
+      title,
+      "--body",
+      body
+    ], workingDir);
+
+    if (createResult.code !== 0) {
+      return extractPrUrlFromText(createResult.stdout) || extractPrUrlFromText(createResult.stderr);
+    }
+
+    return extractPrUrlFromText(createResult.stdout) || extractPrUrlFromText(createResult.stderr);
+  }
+
+  private async resolveCurrentBranch(workingDir: string, preferred?: string): Promise<string> {
+    const preset = String(preferred || "").trim();
+    if (preset) {
+      return preset;
+    }
+
+    const result = await this.exec("git", ["rev-parse", "--abbrev-ref", "HEAD"], workingDir);
+    if (result.code !== 0) {
+      return "";
+    }
+    return String(result.stdout || "").trim();
+  }
+
+  private async findOpenPrUrl(repoName: string, branch: string, workingDir: string): Promise<string> {
+    const result = await this.exec("gh", [
+      "pr",
+      "list",
+      "--repo",
+      repoName,
+      "--head",
+      branch,
+      "--state",
+      "open",
+      "--json",
+      "url"
+    ], workingDir);
+
+    if (result.code !== 0) {
+      return "";
+    }
+
+    try {
+      const parsed = JSON.parse(result.stdout) as Array<{ url?: string }>;
+      const url = String(parsed?.[0]?.url || "").trim();
+      return url;
+    } catch {
+      return extractPrUrlFromText(result.stdout);
+    }
+  }
+
+  private async resolveDefaultBranch(repoName: string, workingDir: string): Promise<string> {
+    const result = await this.exec(
+      "gh",
+      ["repo", "view", repoName, "--json", "defaultBranchRef", "--jq", ".defaultBranchRef.name"],
+      workingDir
+    );
+    if (result.code !== 0) {
+      return "main";
+    }
+    const branch = String(result.stdout || "").trim();
+    return branch || "main";
+  }
+
+  private async commitPendingChangesIfAny(
+    workingDir: string,
+    issueNumber: number,
+    issueTitle: string
+  ): Promise<void> {
+    const status = await this.exec("git", ["status", "--porcelain"], workingDir);
+    if (status.code !== 0) {
+      return;
+    }
+    if (!String(status.stdout || "").trim()) {
+      return;
+    }
+
+    await this.exec("git", ["add", "-A"], workingDir);
+    const message = buildCommitMessage(issueNumber, issueTitle);
+    await this.exec("git", ["commit", "-m", message], workingDir);
+  }
+
+  private async pushBranch(workingDir: string, branch: string): Promise<void> {
+    await this.exec("git", ["push", "-u", "origin", branch], workingDir);
+  }
+
+  private async countAheadCommits(workingDir: string, defaultBranch: string): Promise<number> {
+    await this.exec("git", ["fetch", "origin", defaultBranch, "--quiet"], workingDir);
+    const result = await this.exec("git", ["rev-list", "--count", `origin/${defaultBranch}..HEAD`], workingDir);
+    if (result.code !== 0) {
+      return 0;
+    }
+    const count = Number(String(result.stdout || "").trim());
+    return Number.isFinite(count) ? count : 0;
+  }
+
+  private async exec(command: string, args: string[], cwd: string): Promise<CommandResult> {
+    try {
+      return await this.commandRunner(command, args, { cwd });
+    } catch (error) {
+      return {
+        code: 1,
+        stdout: "",
+        stderr: String(error)
+      };
+    }
+  }
+}
+
+function normalizeImplementationResult(payload: Record<string, unknown>): {
+  summary: string;
+  rootCause: string;
+  solution: string;
+  prUrl: string;
+  testCases: unknown[];
+} {
+  return {
+    summary: String(payload.summary ?? ""),
+    rootCause: String(payload.root_cause ?? payload.rootCause ?? ""),
+    solution: String(payload.solution ?? ""),
+    prUrl: String(payload.pr_url ?? payload.prUrl ?? ""),
+    testCases: Array.isArray(payload.test_cases) ? payload.test_cases : []
+  };
+}
+
+function buildCompletionComment(result: {
+  summary: string;
+  rootCause: string;
+  solution: string;
+  prUrl: string;
+}, reason: string): string {
+  return [
+    "Reason:",
+    reason,
+    "",
+    "Summary:",
+    result.summary,
+    "",
+    "RootCause:",
+    result.rootCause,
+    "",
+    "Solution:",
+    result.solution,
+    "",
+    "PR:",
+    result.prUrl
+  ].join("\n");
+}
+
+function buildIgnoreComment(ignoreWording: string, reason: string): string {
+  const normalizedReason = String(reason || "").trim();
+  if (!normalizedReason) {
+    return ignoreWording;
+  }
+  return [ignoreWording, "", "原因:", normalizedReason].join("\n");
+}
+
+function buildCommitMessage(issueNumber: number, issueTitle: string): string {
+  const title = String(issueTitle || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 80);
+  if (!title) {
+    return `fix(issue-${issueNumber}): apply issue hunter changes`;
+  }
+  return `fix(issue-${issueNumber}): ${title}`;
+}
+
+function buildPrTitle(issueNumber: number, issueTitle: string): string {
+  const title = String(issueTitle || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 80);
+  if (!title) {
+    return `fix: issue #${issueNumber}`;
+  }
+  return `fix: issue #${issueNumber} ${title}`;
+}
+
+function buildPrBody(issueNumber: number, triageReason: string): string {
+  const reason = String(triageReason || "").trim() || "(empty)";
+  return [
+    `Auto-created by github-issue-hunter for issue #${issueNumber}.`,
+    "",
+    `Reason: ${reason}`,
+    "",
+    `Refs #${issueNumber}`
+  ].join("\n");
+}
+
+function extractPrUrlFromText(text: string): string {
+  const match = String(text || "").match(/https?:\/\/github\.com\/[^\s)]+\/pull\/\d+/i);
+  return match ? match[0] : "";
+}
+
+function buildTriageThreadMessage(result: Record<string, unknown>): string {
+  const markdown = String(result.markdown ?? "").trim();
+  if (markdown) {
+    return ["Triage 分析:", truncateForThread(markdown, 3000)].join("\n\n");
+  }
+
+  const reason = String(result.reason ?? "").trim();
+  if (reason) {
+    return ["Triage 理由:", truncateForThread(reason, 3000)].join("\n\n");
+  }
+
+  return [
+    "Triage 返回:",
+    "```json",
+    serializeForThread(result, 3000),
+    "```"
+  ].join("\n");
+}
+
+function serializeForThread(payload: Record<string, unknown>, maxLength: number): string {
+  let text = "";
+  try {
+    text = JSON.stringify(payload, null, 2);
+  } catch {
+    text = String(payload);
+  }
+
+  if (text.length <= maxLength) {
+    return text;
+  }
+
+  return `${text.slice(0, Math.max(0, maxLength - 18))}... (truncated)`;
+}
+
+function extractImageUrls(issue: Record<string, unknown>, comments: Record<string, unknown>[]): string[] {
+  const texts = [String(issue.body ?? "")].concat(comments.map((item) => String(item.body ?? "")));
+  const markdown = /!\[[^\]]*\]\(([^)\s]+)\)/g;
+  const html = /<img[^>]*src=["']([^"']+)["'][^>]*>/gi;
+
+  const unique = new Set<string>();
+  for (const text of texts) {
+    for (const match of text.matchAll(markdown)) {
+      unique.add(match[1]);
+    }
+    for (const match of text.matchAll(html)) {
+      unique.add(match[1]);
+    }
+  }
+  return [...unique];
+}
+
+function nowIso(): string {
+  return new Date().toISOString();
+}
+
+function createCodexProgressRelay(
+  notifier: IssueNotifier | null,
+  threadTs: string,
+  intervalMs: number
+): {
+  push: (update: string) => Promise<void>;
+  stop: () => Promise<void>;
+} {
+  if (!notifier || !threadTs) {
+    return {
+      push: async () => undefined,
+      stop: async () => undefined
+    };
+  }
+
+  let pending: string[] = [];
+  let sending = false;
+  let stopped = false;
+  let lastSentAt = 0;
+  let lastSentText = "";
+
+  const sendPending = async (force: boolean): Promise<void> => {
+    if (sending || stopped || pending.length === 0) {
+      return;
+    }
+    const now = Date.now();
+    if (!force && lastSentAt > 0 && now - lastSentAt < intervalMs) {
+      return;
+    }
+
+    const text = pending.join("\n\n──────────\n\n");
+    if (!force && text === lastSentText) {
+      return;
+    }
+
+    pending = [];
+    sending = true;
+    try {
+      await notifier.postThreadUpdate(threadTs, text);
+      lastSentText = text;
+      lastSentAt = Date.now();
+    } catch {
+      // Ignore Slack transient failures; progress reporting is best-effort.
+    } finally {
+      sending = false;
+    }
+  };
+
+  const timer = setInterval(() => {
+    void sendPending(false);
+  }, 1000);
+
+  return {
+    push: async (update: string) => {
+      const text = normalizeProgressUpdate(update);
+      if (!text || stopped) {
+        return;
+      }
+      if (pending[pending.length - 1] !== text) {
+        pending.push(text);
+      }
+      await sendPending(false);
+    },
+    stop: async () => {
+      clearInterval(timer);
+      await sendPending(true);
+      stopped = true;
+    }
+  };
+}
+
+function normalizeProgressUpdate(update: string): string {
+  const text = String(update || "").trim();
+  if (!text) {
+    return "";
+  }
+  return text.length > 700 ? `${text.slice(0, 697)}...` : text;
+}
+
+function normalizeIssueCommentBody(body: string): string {
+  return stripIssueHunterMarker(String(body || "").trim().replace(/\r\n/g, "\n"));
+}
+
+function truncateForThread(text: string, maxLength: number): string {
+  if (text.length <= maxLength) {
+    return text;
+  }
+  return `${text.slice(0, Math.max(0, maxLength - 18))}... (truncated)`;
+}
+
+function resolveTriageNeedsProcessing(result: Record<string, unknown>): boolean {
+  const direct = result.needs_processing ?? result.needsProcessing;
+  if (typeof direct === "boolean") {
+    return direct;
+  }
+  if (typeof direct === "string") {
+    const normalized = direct.trim().toLowerCase();
+    if (normalized === "true") {
+      return true;
+    }
+    if (normalized === "false") {
+      return false;
+    }
+  }
+  return false;
+}
+
+function triggerTypeLabel(triggerType: IssueTaskInput["triggerType"]): string {
+  if (triggerType === "new_comment") {
+    return "GitHub 新评论";
+  }
+  if (triggerType === "slack_signal") {
+    return "Slack 新指令";
+  }
+  if (triggerType === "retry_failed") {
+    return "失败重试";
+  }
+  if (triggerType === "manual") {
+    return "手动触发";
+  }
+  return "新 issue";
+}
+
+function hasPendingSlackSignal(record: IssueExecutionRecord | null): boolean {
+  if (!record) {
+    return false;
+  }
+  const signalAt = String(record.lastSlackSignalAt || "").trim();
+  if (!signalAt) {
+    return false;
+  }
+  const handledAt = String(record.lastHandledSlackSignalAt || "").trim();
+  return signalAt !== handledAt;
+}
+
+function findLatestExternalComment(comments: Record<string, unknown>[]): { id: number; createdAt: string } {
+  let maxId = 0;
+  let createdAt = "";
+  for (const comment of comments) {
+    const body = String(comment.body ?? "");
+    if (isIssueHunterManagedComment(body)) {
+      continue;
+    }
+
+    const id = Number(comment.id);
+    if (Number.isFinite(id) && id > maxId) {
+      maxId = id;
+      createdAt = String(comment.created_at ?? comment.updated_at ?? "");
+    }
+  }
+  return { id: maxId, createdAt };
+}
+
+function withSyntheticSignalComments(
+  comments: Record<string, unknown>[],
+  triggerType: IssueTaskInput["triggerType"],
+  slackSignalText: string
+): Record<string, unknown>[] {
+  if (triggerType !== "slack_signal") {
+    return comments;
+  }
+
+  const signalText = String(slackSignalText || "").trim();
+  if (!signalText) {
+    return comments;
+  }
+
+  const synthetic = {
+    id: "slack-signal",
+    body: `User sent a new Slack thread instruction:\n\n${signalText}`,
+    created_at: new Date().toISOString(),
+    user: { login: "slack-thread-user", type: "User" }
+  };
+  return [...comments, synthetic];
+}
+
+function buildImplementUserMessage(
+  issue: Record<string, unknown>,
+  comments: Record<string, unknown>[],
+  triggerType: IssueTaskInput["triggerType"],
+  slackSignalText: string
+): string {
+  const issueBody = String(issue.body ?? "").trim();
+  const issueTitle = String(issue.title ?? "").trim();
+
+  if (triggerType === "slack_signal") {
+    const signal = String(slackSignalText || "").trim();
+    if (signal) {
+      return signal;
+    }
+  }
+
+  if (triggerType === "new_comment") {
+    const latestExternal = findLatestExternalCommentBody(comments);
+    if (latestExternal) {
+      return latestExternal;
+    }
+  }
+
+  if (issueBody) {
+    return issueBody;
+  }
+  if (issueTitle) {
+    return issueTitle;
+  }
+  return "Please inspect the current issue context and decide the next implementation steps.";
+}
+
+function findLatestExternalCommentBody(comments: Record<string, unknown>[]): string {
+  let chosenId = 0;
+  let chosenBody = "";
+  for (const comment of comments) {
+    const body = String(comment.body ?? "").trim();
+    if (!body || isIssueHunterManagedComment(body)) {
+      continue;
+    }
+
+    const id = Number(comment.id);
+    if (Number.isFinite(id)) {
+      if (id >= chosenId) {
+        chosenId = id;
+        chosenBody = body;
+      }
+      continue;
+    }
+
+    if (!chosenBody) {
+      chosenBody = body;
+    }
+  }
+  return chosenBody;
+}
+
+const ISSUE_HUNTER_COMMENT_MARKER = "<!-- issue-hunter:auto -->";
+
+function appendIssueHunterMarker(body: string): string {
+  const normalized = String(body || "").trim();
+  if (!normalized) {
+    return "";
+  }
+  if (normalized.includes(ISSUE_HUNTER_COMMENT_MARKER)) {
+    return normalized;
+  }
+  return `${normalized}\n\n${ISSUE_HUNTER_COMMENT_MARKER}`;
+}
+
+function stripIssueHunterMarker(body: string): string {
+  return body.replace(new RegExp(`\\n?\\n?${escapeRegExp(ISSUE_HUNTER_COMMENT_MARKER)}\\s*$`), "").trim();
+}
+
+function isIssueHunterManagedComment(body: string): boolean {
+  return String(body || "").includes(ISSUE_HUNTER_COMMENT_MARKER);
+}
+
+function escapeRegExp(value: string): string {
+  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function createLimiter(concurrency: number) {
+  const queue: Array<() => void> = [];
+  let active = 0;
+
+  return async <T>(task: () => Promise<T>): Promise<T> =>
+    new Promise<T>((resolve, reject) => {
+      const execute = () => {
+        active += 1;
+        task()
+          .then(resolve, reject)
+          .finally(() => {
+            active -= 1;
+            const next = queue.shift();
+            if (next) {
+              next();
+            }
+          });
+      };
+
+      if (active < concurrency) {
+        execute();
+      } else {
+        queue.push(execute);
+      }
+    });
+}
+
+function deriveThreadTokenAliases(token: string): string[] {
+  const raw = String(token || "").trim();
+  if (!raw) {
+    return [];
+  }
+
+  const aliases = new Set<string>([raw]);
+  if (raw.startsWith("slack:")) {
+    const parts = raw.split(":");
+    if (parts.length >= 3) {
+      const threadTs = parts.slice(2).join(":").trim();
+      if (threadTs) {
+        aliases.add(threadTs);
+      }
+      if (parts[1] && threadTs) {
+        aliases.add(`slack:${parts[1]}:${threadTs}`);
+      }
+    }
+  }
+
+  return [...aliases];
+}
+
+function isCancellationError(message: string): boolean {
+  const text = String(message || "").toLowerCase();
+  return text.includes("cancelled by stop request") || text.includes("cancelled by stop command");
+}
+
+function shouldRetryFailedRecord(record: IssueExecutionRecord | null): boolean {
+  if (!record || record.state !== "failed") {
+    return false;
+  }
+
+  const autoRetry = String(process.env.FAILED_ISSUE_AUTO_RETRY || "")
+    .trim()
+    .toLowerCase();
+  if (!["1", "true", "yes", "on"].includes(autoRetry)) {
+    return false;
+  }
+
+  const cooldownSeconds = Math.max(0, Number(process.env.FAILED_ISSUE_RETRY_COOLDOWN_SECONDS || 300));
+  if (!Number.isFinite(cooldownSeconds)) {
+    return false;
+  }
+
+  const updatedAt = Date.parse(record.updatedAt || "");
+  if (!Number.isFinite(updatedAt)) {
+    return true;
+  }
+
+  return Date.now() - updatedAt >= cooldownSeconds * 1000;
+}
