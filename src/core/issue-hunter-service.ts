@@ -122,6 +122,7 @@ interface WorkerMessage {
 export class IssueHunterService {
   private timer: NodeJS.Timeout | null = null;
   private runOnceInFlight: Promise<void> | null = null;
+  private lastSchedulerTickMs = 0;
   private readonly runtimeStore: FileRuntimeStore;
   private readonly chatBridge: ChatSlackBridge;
   private readonly slackChannelCodexManager: SlackChannelCodexManager;
@@ -205,7 +206,21 @@ export class IssueHunterService {
     });
 
     await this.runOnceSafe().catch(() => undefined);
+    this.lastSchedulerTickMs = Date.now();
     this.timer = setInterval(() => {
+      const now = Date.now();
+      const driftMs = now - this.lastSchedulerTickMs - intervalMs;
+      this.lastSchedulerTickMs = now;
+
+      if (driftMs > Math.max(60_000, intervalMs * 2)) {
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[issue-hunter] Scheduler drift detected (${driftMs}ms). ` +
+            "Possible system sleep/network pause. Reinitializing Slack bridge and running catch-up scan."
+        );
+        void this.initializeRealtimeIntegrations().catch(() => undefined);
+      }
+
       void this.runOnceSafe().catch(() => undefined);
     }, intervalMs);
   }
@@ -215,6 +230,7 @@ export class IssueHunterService {
       clearInterval(this.timer);
       this.timer = null;
     }
+    this.lastSchedulerTickMs = 0;
 
     for (const worker of this.workersByIssueKey.values()) {
       try {

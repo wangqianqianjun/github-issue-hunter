@@ -61,6 +61,8 @@ export class ChatSlackBridge {
   private warnedSocketModeDisabledInWorker = false;
   private botUserId = "";
   private botId = "";
+  private socketModeLastConnectedAt = 0;
+  private socketModeLastDisconnectedAt = 0;
 
   constructor(
     private readonly configStore: ConfigStore,
@@ -101,25 +103,20 @@ export class ChatSlackBridge {
       return false;
     }
 
-    try {
-      const auth = await new WebClient(botToken).auth.test();
-      this.botUserId = String(auth.user_id ?? auth.user ?? "").trim();
-      this.botId = String(auth.bot_id ?? "").trim();
-      void this.logSlackInfo(
-        `[issue-hunter][slack] bot identity user=${this.botUserId || "-"} bot_id=${this.botId || "-"}`
-      );
-    } catch {
-      this.botUserId = "";
-      this.botId = "";
-      void this.logSlackWarn("[issue-hunter][slack] failed to resolve bot identity via auth.test");
-    }
-
     this.subscriptionFile = resolveThreadSubscriptionFile(this.configStore.resolvedPath());
     this.slackEventLogFile = resolveSlackEventLogFile(this.configStore.resolvedPath());
     const fingerprint = `${botToken.length}:${signingSecret.length}:${appToken.length}:${socketModeEnabled ? 1 : 0}:${config.slackApp.botDisplayName}:${config.slackApp.appDisplayName}:${this.subscriptionFile}`;
     if (fingerprint === this.initializedFingerprint && this.chat && this.slackAdapter) {
+      if ((!this.botUserId && !this.botId) || (Date.now() - this.socketModeLastConnectedAt > 15 * 60 * 1000)) {
+        await this.refreshBotIdentity(botToken);
+      }
+      if (socketModeEnabled) {
+        await this.ensureHealthySocketModeClient(appToken);
+      }
       return true;
     }
+
+    await this.refreshBotIdentity(botToken);
 
     await this.stopSocketModeClient();
     if (this.chat) {
@@ -386,11 +383,29 @@ export class ChatSlackBridge {
       return;
     }
 
-    const client = new SocketModeClient({ appToken });
+    const clientPingTimeout = parsePositiveNumber(
+      process.env.ISSUE_HUNTER_SLACK_CLIENT_PING_TIMEOUT_MS,
+      20_000
+    );
+    const serverPingTimeout = parsePositiveNumber(
+      process.env.ISSUE_HUNTER_SLACK_SERVER_PING_TIMEOUT_MS,
+      120_000
+    );
+    const client = new SocketModeClient({
+      appToken,
+      autoReconnectEnabled: true,
+      clientPingTimeout,
+      serverPingTimeout
+    });
+    void this.logSlackInfo(
+      `[issue-hunter] Slack Socket Mode options clientPingTimeout=${clientPingTimeout}ms serverPingTimeout=${serverPingTimeout}ms`
+    );
     client.on("connected", () => {
+      this.socketModeLastConnectedAt = Date.now();
       void this.logSlackInfo("[issue-hunter] Slack Socket Mode connected");
     });
     client.on("disconnected", (error: unknown) => {
+      this.socketModeLastDisconnectedAt = Date.now();
       void this.logSlackWarn(
         `[issue-hunter] Slack Socket Mode disconnected ${
           error instanceof Error ? error.message : String(error)
@@ -473,6 +488,48 @@ export class ChatSlackBridge {
       await client.disconnect();
     } catch {
       // Ignore shutdown errors.
+    }
+  }
+
+  private async ensureHealthySocketModeClient(appToken: string): Promise<void> {
+    if (!this.socketModeEnabled) {
+      return;
+    }
+    if (!appToken) {
+      return;
+    }
+
+    if (!this.socketModeClient) {
+      await this.startSocketModeClient(appToken);
+      return;
+    }
+
+    const disconnectedLongEnough =
+      this.socketModeLastDisconnectedAt > this.socketModeLastConnectedAt &&
+      Date.now() - this.socketModeLastDisconnectedAt > 90_000;
+    if (!disconnectedLongEnough) {
+      return;
+    }
+
+    await this.logSlackWarn(
+      "[issue-hunter] Slack Socket Mode stayed disconnected >90s. Recreating socket client."
+    );
+    await this.stopSocketModeClient();
+    await this.startSocketModeClient(appToken);
+  }
+
+  private async refreshBotIdentity(botToken: string): Promise<void> {
+    try {
+      const auth = await new WebClient(botToken).auth.test();
+      this.botUserId = String(auth.user_id ?? auth.user ?? "").trim();
+      this.botId = String(auth.bot_id ?? "").trim();
+      await this.logSlackInfo(
+        `[issue-hunter][slack] bot identity user=${this.botUserId || "-"} bot_id=${this.botId || "-"}`
+      );
+    } catch {
+      this.botUserId = "";
+      this.botId = "";
+      await this.logSlackWarn("[issue-hunter][slack] failed to resolve bot identity via auth.test");
     }
   }
 
@@ -702,6 +759,14 @@ export function normalizePostedSlackThreadId(channelId: string, threadId: string
     return candidate;
   }
   return `slack:${channel}:`;
+}
+
+function parsePositiveNumber(raw: string | undefined, fallback: number): number {
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value <= 0) {
+    return fallback;
+  }
+  return Math.floor(value);
 }
 
 function hasConcreteSlackThreadTs(threadId: string): boolean {
