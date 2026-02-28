@@ -27,6 +27,7 @@ export interface GlobalConfig {
   workspaceDir: string;
   closeIssueOnDone: boolean;
   keepWorktrees: boolean;
+  planMode: boolean;
 }
 
 export interface SlackAppConfig {
@@ -65,7 +66,15 @@ export interface IssueExecutionRecord {
   issueKey: string;
   repoId: string;
   issueNumber: number;
-  state: "new" | "triaging" | "ignored" | "scheduled" | "implementing" | "completed" | "failed";
+  state:
+    | "new"
+    | "triaging"
+    | "ignored"
+    | "awaiting_approval"
+    | "scheduled"
+    | "implementing"
+    | "completed"
+    | "failed";
   summary: string;
   prUrl: string;
   rootCause: string;
@@ -80,6 +89,6 @@ export interface IssueExecutionRecord {
   codexSessionId?: string;
   triageSessionId?: string;
   implementSessionId?: string;
-  lastTriggerType?: "new" | "retry_failed" | "new_comment" | "slack_signal" | "manual";
+  lastTriggerType?: "new" | "retry_failed" | "new_comment" | "slack_signal" | "approval" | "manual";
   updatedAt: string;
 }

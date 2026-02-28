@@ -17,7 +17,8 @@ const DEFAULT_CONFIG: AppConfig = {
     globalConcurrency: 2,
     workspaceDir: ".",
     closeIssueOnDone: false,
-    keepWorktrees: false
+    keepWorktrees: false,
+    planMode: true
   },
   slackApp: {
     enabled: false,

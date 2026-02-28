@@ -21,6 +21,7 @@ describe("ConfigStore", () => {
 
     expect(config.repositories).toEqual([]);
     expect(config.global.pollIntervalSeconds).toBe(30);
+    expect(config.global.planMode).toBe(true);
   });
 
   it("upserts repository with local path and commands", async () => {

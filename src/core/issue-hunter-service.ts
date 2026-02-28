@@ -108,7 +108,7 @@ interface WorkerTask {
   repo: RepositoryConfig;
   issueNumber: number;
   issueKey: string;
-  triggerType: "new" | "retry_failed" | "new_comment" | "slack_signal" | "manual";
+  triggerType: "new" | "retry_failed" | "new_comment" | "slack_signal" | "approval" | "manual";
 }
 
 interface WorkerMessage {
@@ -1108,11 +1108,17 @@ function extractFirstHttpUrl(text: string): string {
 }
 
 function isBoardVisibleState(state: IssueExecutionRecord["state"]): boolean {
-  return state === "triaging" || state === "scheduled" || state === "implementing" || state === "completed";
+  return (
+    state === "triaging" ||
+    state === "awaiting_approval" ||
+    state === "scheduled" ||
+    state === "implementing" ||
+    state === "completed"
+  );
 }
 
 function boardStateWeight(state: IssueExecutionRecord["state"]): number {
-  if (state === "triaging" || state === "scheduled" || state === "implementing") {
+  if (state === "triaging" || state === "awaiting_approval" || state === "scheduled" || state === "implementing") {
     return 0;
   }
   if (state === "completed") {

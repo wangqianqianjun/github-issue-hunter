@@ -102,7 +102,7 @@ interface IssueTaskInput {
   issueNumber: number;
   issueKey: string;
   existingRecord: IssueExecutionRecord | null;
-  triggerType: "new" | "retry_failed" | "new_comment" | "slack_signal" | "manual";
+  triggerType: "new" | "retry_failed" | "new_comment" | "slack_signal" | "approval" | "manual";
 }
 
 type IssueTriggerType = IssueTaskInput["triggerType"];
@@ -276,6 +276,7 @@ export class IssueEngine {
           existingRecord?.state !== "implementing";
 
         let retryNewComment = false;
+        let retryApproval = false;
         if (
           seen &&
           !retryFailed &&
@@ -291,7 +292,20 @@ export class IssueEngine {
           retryNewComment = latestExternal.id > baseline;
         }
 
-        const shouldSchedule = !seen || seenWithoutRecord || retryFailed || retrySlackSignal || retryNewComment;
+        if (
+          seen &&
+          !retryFailed &&
+          !retrySlackSignal &&
+          !retryNewComment &&
+          existingRecord?.state === "awaiting_approval"
+        ) {
+          const comments = await github.listIssueComments(issueNumber);
+          const baseline = Number(existingRecord.lastExternalCommentId || 0);
+          retryApproval = hasApprovalCommentSince(comments, baseline);
+        }
+
+        const shouldSchedule =
+          !seen || seenWithoutRecord || retryFailed || retrySlackSignal || retryNewComment || retryApproval;
         if (!shouldSchedule || !this.coordinator.tryAcquire(issueKey)) {
           continue;
         }
@@ -314,7 +328,9 @@ export class IssueEngine {
               ? "retry_failed"
               : retrySlackSignal
                 ? "slack_signal"
-                : "new_comment"
+                : retryApproval
+                  ? "approval"
+                  : "new_comment"
         });
       }
     }
@@ -342,13 +358,16 @@ export class IssueEngine {
     ).trim();
     const handledSlackSignalAt =
       input.triggerType === "slack_signal" ? inheritedSlackSignalAt : inheritedHandledSlackSignalAt;
+    const approvalModeTrigger =
+      input.triggerType === "approval" && input.existingRecord?.state === "awaiting_approval";
 
     const contextComments = withSyntheticSignalComments(issueComments, input.triggerType, inheritedSlackSignalText);
     const implementUserMessage = buildImplementUserMessage(
       issue,
       issueComments,
       input.triggerType,
-      inheritedSlackSignalText
+      inheritedSlackSignalText,
+      input.existingRecord
     );
 
     const baseRecord = (state: IssueExecutionRecord["state"], patch: Partial<IssueExecutionRecord>): IssueExecutionRecord => ({
@@ -373,15 +392,20 @@ export class IssueEngine {
       lastTriggerType: patch.lastTriggerType ?? input.triggerType,
       updatedAt: nowIso()
     });
+    const threadBatchIntervalMs =
+      Math.max(5, Number(process.env.ISSUE_HUNTER_SLACK_BATCH_INTERVAL_SECONDS || 45)) * 1000;
+    const threadBatcher = createThreadUpdateBatcher(input.notifier, threadTs, threadBatchIntervalMs);
 
     try {
-      await this.createIssueCommentIfNeeded(
-        input.github,
-        input.issueNumber,
-        input.repo.triageWording,
-        issueComments
-      );
-      await this.deps.runtimeStore.saveRecord(baseRecord("triaging", {}));
+      if (!approvalModeTrigger) {
+        await this.createIssueCommentIfNeeded(
+          input.github,
+          input.issueNumber,
+          input.repo.triageWording,
+          issueComments
+        );
+        await this.deps.runtimeStore.saveRecord(baseRecord("triaging", {}));
+      }
 
       const imageUrls = extractImageUrls(issue, issueComments);
       const workspace = await this.prepareWorkspace(
@@ -399,69 +423,143 @@ export class IssueEngine {
           if (!threadTs) {
             threadTs = await input.notifier.postIssueStart(issue);
           }
+          threadBatcher.setThread(threadTs);
           this.registerThreadToken(input.issueKey, threadTs);
           await this.deps.onThreadRegistered?.(input.issueKey, threadTs, input.repo);
           const startMessage =
-            input.triggerType === "new"
-              ? "Issue 已进入评估阶段，开始 triage。"
+            approvalModeTrigger
+              ? "已收到用户 approve，跳过 triage，开始按已确认方案执行实现。"
+              : input.triggerType === "new"
+                ? "Issue 已进入评估阶段，开始 triage。"
               : input.triggerType === "retry_failed"
                 ? "检测到上次执行失败，开始重试 triage。"
                 : `收到新反馈（${triggerTypeLabel(input.triggerType)}），开始重新 triage。`;
-          await input.notifier.postThreadUpdate(threadTs, startMessage);
+          await threadBatcher.push(startMessage, { immediate: true });
         }
 
-        const triageRelay = createCodexProgressRelay(input.notifier, threadTs, progressIntervalMs);
-        let triage: Record<string, unknown>;
-        try {
-          triage = await input.codex.runTriage(
-            workspace.contextFile,
-            input.issueNumber,
-            issueTitle,
-            workspace.worktreePath,
-            async (update) => {
-              await triageRelay.push(update);
+        let triageReason = String(input.existingRecord?.summary ?? "").trim();
+        let needsProcessing = true;
+
+        if (!approvalModeTrigger) {
+          const triageRelay = createCodexProgressRelay(
+            async (message) => {
+              await threadBatcher.push(message);
             },
-            abortController.signal,
-            currentCodexSessionId
+            progressIntervalMs
           );
-        } finally {
-          await triageRelay.stop();
-        }
+          let triage: Record<string, unknown>;
+          try {
+            triage = await input.codex.runTriage(
+              workspace.contextFile,
+              input.issueNumber,
+              issueTitle,
+              workspace.worktreePath,
+              async (update) => {
+                await triageRelay.push(update);
+              },
+              abortController.signal,
+              currentCodexSessionId
+            );
+          } finally {
+            await triageRelay.stop();
+          }
 
-        const needsProcessing = resolveTriageNeedsProcessing(triage);
-        const triageReason = String(triage.reason ?? "").trim();
-        const triageSessionId = String(triage.codex_session_id ?? triage.thread_id ?? "").trim();
-        if (triageSessionId) {
-          currentCodexSessionId = triageSessionId;
-        }
+          needsProcessing = resolveTriageNeedsProcessing(triage);
+          triageReason = String(triage.reason ?? "").trim();
+          const triageSessionId = String(triage.codex_session_id ?? triage.thread_id ?? "").trim();
+          if (triageSessionId) {
+            currentCodexSessionId = triageSessionId;
+          }
 
-        if (input.notifier && threadTs) {
-          await input.notifier.postThreadUpdate(threadTs, buildTriageThreadMessage(triage));
-          await input.notifier.postThreadUpdate(
-            threadTs,
-            needsProcessing
-              ? "决定：进入开发处理。"
-              : "决定：当前不进入开发处理。"
-          );
-        }
+          if (input.notifier && threadTs) {
+            await threadBatcher.push(buildTriageThreadMessage(triage));
+            await threadBatcher.push(
+              needsProcessing
+                ? "决定：进入开发处理。"
+                : "决定：当前不进入开发处理。"
+            );
+          }
 
-        if (!needsProcessing) {
-          await this.createIssueCommentIfNeeded(
-            input.github,
-            input.issueNumber,
-            buildIgnoreComment(input.repo.ignoreWording, triageReason),
-            issueComments
-          );
-          await this.deps.runtimeStore.saveRecord(
-            baseRecord("ignored", {
-              summary: String(triage.reason ?? ""),
-              codexSessionId: currentCodexSessionId,
-              triageSessionId: currentCodexSessionId,
-              implementSessionId: currentCodexSessionId,
-              threadTs
-            })
-          );
-          return;
+          if (!needsProcessing) {
+            await this.createIssueCommentIfNeeded(
+              input.github,
+              input.issueNumber,
+              buildIgnoreComment(input.repo.ignoreWording, triageReason),
+              issueComments
+            );
+            await this.deps.runtimeStore.saveRecord(
+              baseRecord("ignored", {
+                summary: String(triage.reason ?? ""),
+                codexSessionId: currentCodexSessionId,
+                triageSessionId: currentCodexSessionId,
+                implementSessionId: currentCodexSessionId,
+                threadTs
+              })
+            );
+            return;
+          }
+
+          if (input.config.global.planMode) {
+            if (input.notifier && threadTs) {
+              await threadBatcher.push("Plan 模式已开启，先生成详细方案并等待审批。");
+            }
+
+            const planningRelay = createCodexProgressRelay(
+              async (message) => {
+                await threadBatcher.push(message);
+              },
+              progressIntervalMs
+            );
+            let planningResult: Record<string, unknown>;
+            try {
+              planningResult = await input.codex.runImplementation(
+                workspace.contextFile,
+                input.issueNumber,
+                issueTitle,
+                buildPlanOnlyUserMessage(implementUserMessage, triageReason),
+                workspace.worktreePath,
+                async (update) => {
+                  await planningRelay.push(update);
+                },
+                abortController.signal,
+                currentCodexSessionId
+              );
+            } finally {
+              await planningRelay.stop();
+            }
+
+            const planningSessionId = String(
+              planningResult.codex_session_id ?? planningResult.thread_id ?? ""
+            ).trim();
+            if (planningSessionId) {
+              currentCodexSessionId = planningSessionId;
+            }
+
+            const planning = normalizeImplementationResult(planningResult);
+            const planSnapshot = buildPlanSnapshot(planning);
+            await this.createIssueCommentIfNeeded(
+              input.github,
+              input.issueNumber,
+              buildPlanProposalComment(input.repo.implementWording, triageReason, planning),
+              issueComments
+            );
+            await this.deps.runtimeStore.saveRecord(
+              baseRecord("awaiting_approval", {
+                summary: triageReason || planning.summary || "已提交设计与实现方案，等待审批。",
+                rootCause: planning.rootCause,
+                solution: planSnapshot,
+                codexSessionId: currentCodexSessionId,
+                triageSessionId: currentCodexSessionId,
+                implementSessionId: currentCodexSessionId,
+                threadTs
+              })
+            );
+
+            if (input.notifier && threadTs) {
+              await threadBatcher.push("方案已写回 issue，等待用户 approve 后再开始实际实现。");
+            }
+            return;
+          }
         }
 
         await this.createIssueCommentIfNeeded(
@@ -472,6 +570,10 @@ export class IssueEngine {
         );
         await this.deps.runtimeStore.saveRecord(
           baseRecord("scheduled", {
+            summary: approvalModeTrigger ? String(input.existingRecord?.summary || "") : "",
+            rootCause: approvalModeTrigger ? String(input.existingRecord?.rootCause || "") : "",
+            solution: approvalModeTrigger ? String(input.existingRecord?.solution || "") : "",
+            threadTs,
             codexSessionId: currentCodexSessionId,
             triageSessionId: currentCodexSessionId,
             implementSessionId: currentCodexSessionId
@@ -479,18 +581,22 @@ export class IssueEngine {
         );
 
         if (input.notifier && threadTs) {
-          await input.notifier.postThreadUpdate(threadTs, "Issue 已进入处理队列，开始执行修复。");
+          await threadBatcher.push("Issue 已进入处理队列，开始执行修复。");
         }
 
         await this.deps.runtimeStore.saveRecord(
           baseRecord("implementing", {
+            summary: approvalModeTrigger ? String(input.existingRecord?.summary || "") : "",
+            rootCause: approvalModeTrigger ? String(input.existingRecord?.rootCause || "") : "",
+            solution: approvalModeTrigger ? String(input.existingRecord?.solution || "") : "",
             threadTs
           })
         );
 
         const progressRelay = createCodexProgressRelay(
-          input.notifier,
-          threadTs,
+          async (message) => {
+            await threadBatcher.push(message);
+          },
           progressIntervalMs
         );
 
@@ -559,7 +665,7 @@ export class IssueEngine {
         await this.deps.writeBoard(await this.deps.runtimeStore.listCompleted());
 
         if (input.notifier && threadTs) {
-          await input.notifier.postThreadUpdate(threadTs, `处理完成。PR: ${normalized.prUrl || "未提供"}`);
+          await threadBatcher.push(`处理完成。PR: ${normalized.prUrl || "未提供"}`, { immediate: true });
         }
       } finally {
         await workspace.cleanup();
@@ -574,12 +680,12 @@ export class IssueEngine {
         })
       );
       if (input.notifier && threadTs) {
-        await input.notifier.postThreadUpdate(
-          threadTs,
+        await threadBatcher.push(
           cancelled ? "已收到停止指令，当前 Codex 任务已停止。" : `处理失败: ${message}`
         );
       }
     } finally {
+      await threadBatcher.stop();
       this.runningAbortControllers.delete(input.issueKey);
       this.unregisterThreadTokens(input.issueKey);
       await this.deps.onThreadUnregistered?.(input.issueKey);
@@ -598,7 +704,7 @@ export class IssueEngine {
     }
 
     const issueNumber = Number(issue.number);
-    const issueDir = resolve(repo.localPath, ".issue-hunter", String(issueNumber));
+    const issueDir = resolve(process.cwd(), "artifacts", repo.id, `issue-${issueNumber}`);
     await mkdir(issueDir, { recursive: true });
 
     const imagesDir = join(issueDir, "images");
@@ -919,6 +1025,65 @@ function buildIgnoreComment(ignoreWording: string, reason: string): string {
   return [ignoreWording, "", "原因:", normalizedReason].join("\n");
 }
 
+function buildPlanOnlyUserMessage(originalUserMessage: string, triageReason: string): string {
+  return [
+    "当前为 Plan 模式，只输出方案，不进入编码实现。",
+    "要求：",
+    "1. 必须基于当前仓库代码与 issue 上下文。",
+    "2. 输出中文 Markdown，包含 `Summary`、`RootCause`、`Solution` 三个章节。",
+    "3. `Solution` 必须包含详细实现步骤、测试验证方案、风险与回滚方案。",
+    "4. 不要修改任何代码，不要创建 commit，不要创建或更新 PR。",
+    "",
+    "Triage 原因：",
+    triageReason || "(未提供)",
+    "",
+    "用户原始诉求：",
+    originalUserMessage || "(空)"
+  ].join("\n");
+}
+
+function buildPlanProposalComment(
+  implementWording: string,
+  triageReason: string,
+  plan: { summary: string; rootCause: string; solution: string }
+): string {
+  const summary = String(plan.summary || "").trim() || "（未提供）";
+  const rootCause = String(plan.rootCause || "").trim() || "（未提供）";
+  const solution = String(plan.solution || "").trim() || "（未提供）";
+
+  return [
+    implementWording,
+    "",
+    "### Triage 原因",
+    triageReason || "（未提供）",
+    "",
+    "### 设计概览",
+    summary,
+    "",
+    "### RootCause",
+    rootCause,
+    "",
+    "### 实现方案",
+    solution,
+    "",
+    "### 等待审批",
+    "请在评论区回复 `approve` / `approved` / `同意` / `通过`，我将仅在收到审批后进入实现。"
+  ].join("\n");
+}
+
+function buildPlanSnapshot(plan: { summary: string; rootCause: string; solution: string }): string {
+  return [
+    "Summary:",
+    String(plan.summary || "").trim() || "（未提供）",
+    "",
+    "RootCause:",
+    String(plan.rootCause || "").trim() || "（未提供）",
+    "",
+    "Solution:",
+    String(plan.solution || "").trim() || "（未提供）"
+  ].join("\n");
+}
+
 function buildCommitMessage(issueNumber: number, issueTitle: string): string {
   const title = String(issueTitle || "")
     .replace(/\s+/g, " ")
@@ -1012,15 +1177,109 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
-function createCodexProgressRelay(
+function createThreadUpdateBatcher(
   notifier: IssueNotifier | null,
-  threadTs: string,
+  initialThreadTs: string,
+  intervalMs: number
+): {
+  setThread: (threadToken: string) => void;
+  push: (text: string, options?: { immediate?: boolean }) => Promise<void>;
+  stop: () => Promise<void>;
+} {
+  if (!notifier) {
+    return {
+      setThread: () => undefined,
+      push: async () => undefined,
+      stop: async () => undefined
+    };
+  }
+
+  let threadTs = String(initialThreadTs || "").trim();
+  let pending: string[] = [];
+  let sending = false;
+  let stopped = false;
+  let lastSentAt = 0;
+  let lastSentText = "";
+  const maxChars = Math.max(500, Number(process.env.ISSUE_HUNTER_SLACK_BATCH_MAX_CHARS || 2800));
+  const separator = "\n\n──────────\n\n";
+
+  const sendPending = async (force: boolean): Promise<void> => {
+    if (!threadTs || sending || stopped || pending.length === 0) {
+      return;
+    }
+
+    const now = Date.now();
+    if (!force && lastSentAt > 0 && now - lastSentAt < intervalMs) {
+      return;
+    }
+
+    const text = pending.join(separator);
+    if (!force && text === lastSentText) {
+      return;
+    }
+
+    pending = [];
+    sending = true;
+    try {
+      await notifier.postThreadUpdate(threadTs, text);
+      lastSentText = text;
+      lastSentAt = Date.now();
+    } catch {
+      // Slack transient failures are best-effort, keep runtime flow uninterrupted.
+    } finally {
+      sending = false;
+    }
+  };
+
+  const timer = setInterval(() => {
+    void sendPending(false);
+  }, 1000);
+
+  return {
+    setThread: (threadToken: string) => {
+      threadTs = String(threadToken || "").trim();
+    },
+    push: async (text: string, options?: { immediate?: boolean }) => {
+      if (stopped) {
+        return;
+      }
+      const normalized = normalizeThreadUpdateText(text);
+      if (!normalized) {
+        return;
+      }
+
+      const pendingLength = pending.join(separator).length;
+      const additionalLength = normalized.length + (pending.length > 0 ? separator.length : 0);
+      if (pending.length > 0 && pendingLength + additionalLength > maxChars) {
+        await sendPending(true);
+      }
+
+      if (pending[pending.length - 1] !== normalized) {
+        pending.push(normalized);
+      }
+
+      if (options?.immediate) {
+        await sendPending(true);
+      } else {
+        await sendPending(false);
+      }
+    },
+    stop: async () => {
+      clearInterval(timer);
+      await sendPending(true);
+      stopped = true;
+    }
+  };
+}
+
+function createCodexProgressRelay(
+  postUpdate: ((text: string) => Promise<void> | void) | null,
   intervalMs: number
 ): {
   push: (update: string) => Promise<void>;
   stop: () => Promise<void>;
 } {
-  if (!notifier || !threadTs) {
+  if (!postUpdate) {
     return {
       push: async () => undefined,
       stop: async () => undefined
@@ -1050,7 +1309,7 @@ function createCodexProgressRelay(
     pending = [];
     sending = true;
     try {
-      await notifier.postThreadUpdate(threadTs, text);
+      await postUpdate(text);
       lastSentText = text;
       lastSentAt = Date.now();
     } catch {
@@ -1091,6 +1350,18 @@ function normalizeProgressUpdate(update: string): string {
   return text.length > 700 ? `${text.slice(0, 697)}...` : text;
 }
 
+function normalizeThreadUpdateText(update: string): string {
+  const text = String(update || "").trim();
+  if (!text) {
+    return "";
+  }
+  const maxLength = Math.max(1200, Number(process.env.ISSUE_HUNTER_SLACK_MESSAGE_MAX_CHARS || 3200));
+  if (text.length <= maxLength) {
+    return text;
+  }
+  return `${text.slice(0, Math.max(0, maxLength - 18))}... (truncated)`;
+}
+
 function normalizeIssueCommentBody(body: string): string {
   return stripIssueHunterMarker(String(body || "").trim().replace(/\r\n/g, "\n"));
 }
@@ -1126,6 +1397,9 @@ function triggerTypeLabel(triggerType: IssueTaskInput["triggerType"]): string {
   if (triggerType === "slack_signal") {
     return "Slack 新指令";
   }
+  if (triggerType === "approval") {
+    return "方案审批";
+  }
   if (triggerType === "retry_failed") {
     return "失败重试";
   }
@@ -1145,6 +1419,71 @@ function hasPendingSlackSignal(record: IssueExecutionRecord | null): boolean {
   }
   const handledAt = String(record.lastHandledSlackSignalAt || "").trim();
   return signalAt !== handledAt;
+}
+
+function hasApprovalCommentSince(comments: Record<string, unknown>[], baselineId: number): boolean {
+  return Boolean(findLatestApprovalCommentBody(comments, baselineId));
+}
+
+function findLatestApprovalCommentBody(comments: Record<string, unknown>[], baselineId: number): string {
+  let chosenId = Number.isFinite(baselineId) ? baselineId : 0;
+  let chosenBody = "";
+  for (const comment of comments) {
+    const body = String(comment.body ?? "").trim();
+    if (!body || isIssueHunterManagedComment(body)) {
+      continue;
+    }
+
+    const id = Number(comment.id);
+    if (!Number.isFinite(id) || id <= chosenId) {
+      continue;
+    }
+    if (!isApprovalComment(body)) {
+      continue;
+    }
+
+    chosenId = id;
+    chosenBody = body;
+  }
+
+  return chosenBody;
+}
+
+function isApprovalComment(body: string): boolean {
+  const text = String(body || "").trim();
+  if (!text) {
+    return false;
+  }
+
+  const normalized = text.toLowerCase();
+  const negativePatterns = [
+    /\bnot\s+approve\b/,
+    /\bdo\s+not\s+approve\b/,
+    /\bdisapprove\b/,
+    /\breject\b/,
+    /不同意/,
+    /不通过/,
+    /暂不批准/,
+    /不要开始/
+  ];
+  if (negativePatterns.some((pattern) => pattern.test(normalized) || pattern.test(text))) {
+    return false;
+  }
+
+  const positivePatterns = [
+    /\bapprove\b/,
+    /\bapproved\b/,
+    /\blgtm\b/,
+    /\bgo\s+ahead\b/,
+    /同意/,
+    /通过/,
+    /批准/,
+    /可以开始/,
+    /开始实现/,
+    /按方案实现/,
+    /按方案处理/
+  ];
+  return positivePatterns.some((pattern) => pattern.test(normalized) || pattern.test(text));
 }
 
 function findLatestExternalComment(comments: Record<string, unknown>[]): { id: number; createdAt: string } {
@@ -1192,7 +1531,8 @@ function buildImplementUserMessage(
   issue: Record<string, unknown>,
   comments: Record<string, unknown>[],
   triggerType: IssueTaskInput["triggerType"],
-  slackSignalText: string
+  slackSignalText: string,
+  existingRecord?: IssueExecutionRecord | null
 ): string {
   const issueBody = String(issue.body ?? "").trim();
   const issueTitle = String(issue.title ?? "").trim();
@@ -1201,6 +1541,26 @@ function buildImplementUserMessage(
     const signal = String(slackSignalText || "").trim();
     if (signal) {
       return signal;
+    }
+  }
+
+  if (triggerType === "approval") {
+    const baselineId = Number(existingRecord?.lastExternalCommentId || 0);
+    const approvalComment = findLatestApprovalCommentBody(comments, baselineId);
+    const planSummary = String(existingRecord?.summary || "").trim();
+    const planDetails = String(existingRecord?.solution || "").trim();
+    const approvalMessage = [
+      "User has approved the proposal for this issue. Please implement now.",
+      planSummary ? `Approved triage reason:\n${planSummary}` : "",
+      planDetails ? `Approved design and implementation plan:\n${planDetails}` : "",
+      approvalComment ? `Latest approval comment:\n${approvalComment}` : "",
+      issueBody ? `Original issue body:\n${issueBody}` : ""
+    ]
+      .filter(Boolean)
+      .join("\n\n")
+      .trim();
+    if (approvalMessage) {
+      return approvalMessage;
     }
   }
 

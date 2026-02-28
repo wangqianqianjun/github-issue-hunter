@@ -26,7 +26,7 @@ const makeRepo = (localPath: string): RepositoryConfig => ({
 });
 
 describe("WorkspaceManager", () => {
-  it("writes context file inside target repository path", async () => {
+  it("writes context file under workspace artifacts directory", async () => {
     const root = mkdtempSync(join(tmpdir(), "hunter-workspace-"));
     const repoRoot = join(root, "repo");
     mkdirSync(repoRoot, { recursive: true });
@@ -55,8 +55,9 @@ describe("WorkspaceManager", () => {
       );
       cleanupPaths.push(prepared.contextFile);
 
-      expect(prepared.contextFile.startsWith(repo.localPath)).toBe(true);
-      expect(prepared.contextFile.includes(".issue-hunter")).toBe(true);
+      expect(prepared.contextFile.startsWith(workspaceRoot)).toBe(true);
+      expect(prepared.contextFile.includes("/artifacts/")).toBe(true);
+      expect(prepared.contextFile.includes(".issue-hunter")).toBe(false);
       await prepared.cleanup();
     } finally {
       for (const path of cleanupPaths) {

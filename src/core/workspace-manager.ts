@@ -56,11 +56,8 @@ export class WorkspaceManager {
       imageFiles
     };
 
-    const inRepoContextDir = resolve(workingDir, ".issue-hunter", `issue-${issueNumber}`);
-    await mkdir(inRepoContextDir, { recursive: true });
-    const contextFile = join(inRepoContextDir, "context.json");
+    const contextFile = join(archiveDir, "context.json");
     await writeFile(contextFile, JSON.stringify(contextData, null, 2), "utf8");
-    await writeFile(join(archiveDir, "context.json"), JSON.stringify(contextData, null, 2), "utf8");
 
     return {
       contextFile,

@@ -35,7 +35,8 @@ function makeConfig(repo: RepositoryConfig): AppConfig {
       globalConcurrency: 1,
       workspaceDir: ".",
       closeIssueOnDone: false,
-      keepWorktrees: true
+      keepWorktrees: true,
+      planMode: false
     },
     slackApp: {
       enabled: true,

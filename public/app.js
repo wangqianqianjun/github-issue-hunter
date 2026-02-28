@@ -106,7 +106,8 @@ function bindEvents() {
         globalConcurrency: Number(form.get("globalConcurrency")),
         workspaceDir: String(form.get("workspaceDir") || ""),
         closeIssueOnDone: Boolean(form.get("closeIssueOnDone")),
-        keepWorktrees: Boolean(form.get("keepWorktrees"))
+        keepWorktrees: Boolean(form.get("keepWorktrees")),
+        planMode: Boolean(form.get("planMode"))
       }
     });
     await refreshAll();
@@ -213,6 +214,7 @@ function fillGlobalForm() {
   setInput(els.globalForm, "workspaceDir", global.workspaceDir);
   setCheckbox(els.globalForm, "closeIssueOnDone", global.closeIssueOnDone);
   setCheckbox(els.globalForm, "keepWorktrees", global.keepWorktrees);
+  setCheckbox(els.globalForm, "planMode", global.planMode);
 }
 
 function fillSlackForm() {
@@ -840,7 +842,12 @@ function restoreCodeBlocks(html, blocks) {
 }
 
 function isInProgressBoardState(stateValue) {
-  return stateValue === "triaging" || stateValue === "scheduled" || stateValue === "implementing";
+  return (
+    stateValue === "triaging" ||
+    stateValue === "awaiting_approval" ||
+    stateValue === "scheduled" ||
+    stateValue === "implementing"
+  );
 }
 
 function resolveBoardCardAccent(item, index) {

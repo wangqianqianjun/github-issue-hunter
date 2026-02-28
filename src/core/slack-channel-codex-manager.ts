@@ -166,6 +166,9 @@ export class SlackChannelCodexManager {
       input.channelId,
       String(input.codexSessionIdHint || "").trim()
     );
+    const batchIntervalMs =
+      Math.max(5, Number(process.env.ISSUE_HUNTER_SLACK_BATCH_INTERVAL_SECONDS || 45)) * 1000;
+    const postBatcher = createPostBatcher(input.post, batchIntervalMs);
     const command = buildCodexCommand(session.worktreePath, session.codexSessionId, input.text);
 
     const child = spawn(command.bin, command.args, {
@@ -211,7 +214,7 @@ export class SlackChannelCodexManager {
       if (itemType === "reasoning") {
         const reasoning = String(item.text ?? "").trim();
         if (reasoning) {
-          await input.post(`Assistant: 🧠 ${truncate(reasoning, 300)}`);
+          await postBatcher.push(`Assistant: 🧠 ${truncate(reasoning, 300)}`);
         }
         return;
       }
@@ -263,12 +266,14 @@ export class SlackChannelCodexManager {
 
     if (code !== 0) {
       const detail = truncate(stderr || stdout || `exit=${code}`, 1200);
-      await input.post(`处理失败: ${detail}`);
+      await postBatcher.push(`处理失败: ${detail}`, { immediate: true });
+      await postBatcher.stop();
       return;
     }
 
     const finalText = lastAssistantMessage || extractLastNonEmptyLine(stdout) || "已完成，但未捕获可展示输出。";
-    await input.post(finalText);
+    await postBatcher.push(finalText, { immediate: true });
+    await postBatcher.stop();
   }
 
   private async getOrCreateSession(
@@ -355,6 +360,87 @@ export class SlackChannelCodexManager {
     await mkdir(dirname(resolve(this.sessionFilePath)), { recursive: true });
     await writeFile(this.sessionFilePath, JSON.stringify(payload, null, 2), "utf8");
   }
+}
+
+function createPostBatcher(
+  post: (text: string) => Promise<void>,
+  intervalMs: number
+): {
+  push: (text: string, options?: { immediate?: boolean }) => Promise<void>;
+  stop: () => Promise<void>;
+} {
+  let pending: string[] = [];
+  let sending = false;
+  let stopped = false;
+  let lastSentAt = 0;
+  let lastSentText = "";
+  const maxChars = Math.max(500, Number(process.env.ISSUE_HUNTER_SLACK_BATCH_MAX_CHARS || 2800));
+  const separator = "\n\n──────────\n\n";
+
+  const sendPending = async (force: boolean): Promise<void> => {
+    if (sending || stopped || pending.length === 0) {
+      return;
+    }
+
+    const now = Date.now();
+    if (!force && lastSentAt > 0 && now - lastSentAt < intervalMs) {
+      return;
+    }
+
+    const text = pending.join(separator);
+    if (!force && text === lastSentText) {
+      return;
+    }
+
+    pending = [];
+    sending = true;
+    try {
+      await post(text);
+      lastSentText = text;
+      lastSentAt = Date.now();
+    } catch {
+      // Ignore transient Slack post failures to avoid interrupting codex run.
+    } finally {
+      sending = false;
+    }
+  };
+
+  const timer = setInterval(() => {
+    void sendPending(false);
+  }, 1000);
+
+  return {
+    push: async (text: string, options?: { immediate?: boolean }) => {
+      if (stopped) {
+        return;
+      }
+      const normalized = String(text || "").trim();
+      if (!normalized) {
+        return;
+      }
+
+      const pendingLength = pending.join(separator).length;
+      const additionalLength = normalized.length + (pending.length > 0 ? separator.length : 0);
+      if (pending.length > 0 && pendingLength + additionalLength > maxChars) {
+        await sendPending(true);
+      }
+
+      if (pending[pending.length - 1] !== normalized) {
+        pending.push(normalized);
+      }
+
+      if (options?.immediate) {
+        await sendPending(true);
+      } else {
+        await sendPending(false);
+      }
+    },
+    stop: async () => {
+      clearInterval(timer);
+      await sendPending(true);
+      stopped = true;
+    }
+  };
 }
 
 function findRepoBySlackChannel(config: AppConfig, channelId: string): RepositoryConfig | null {

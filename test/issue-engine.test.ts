@@ -184,7 +184,8 @@ const makeConfig = (repositories: RepositoryConfig[]): AppConfig => ({
     globalConcurrency: 2,
     workspaceDir: ".",
     closeIssueOnDone: true,
-    keepWorktrees: false
+    keepWorktrees: false,
+    planMode: false
   },
   slackApp: {
     enabled: false,
@@ -582,6 +583,119 @@ describe("IssueEngine", () => {
     await engine.runOnce();
     expect(codex.implementRuns).toBe(1);
     expect(codex.lastImplementUserMessage).toBe("still broken after patch");
+  });
+
+  it("enters awaiting approval state in plan mode before implementation", async () => {
+    const repo = makeRepo("repo-a", "acme", "web");
+    const config = makeConfig([repo]);
+    config.global.planMode = true;
+    const gh = new FakeGitHubClient({
+      number: 170,
+      title: "needs design first",
+      body: "please fix with plan",
+      html_url: "https://github.com/acme/web/issues/170"
+    });
+
+    const runtime = new FakeRuntimeStore();
+    const codex = new FakeCodexRunner(
+      { needs_processing: true, reason: "valid bug" },
+      {
+        summary: "split loading and rendering paths",
+        root_cause: "missing separation in current flow",
+        solution: "1) refactor service 2) add tests 3) verify rollback path",
+        pr_url: "",
+        test_cases: []
+      }
+    );
+
+    const engine = new IssueEngine({
+      getConfig: async () => config,
+      runtimeStore: runtime,
+      githubFactory: () => gh,
+      codexFactory: () => codex,
+      notifierFactory: () => null,
+      writeBoard: async () => undefined,
+      writeRegressionCase: async () => undefined,
+      prepareWorkspace: async () => ({ contextFile: "/tmp/context.json", cleanup: async () => undefined })
+    });
+
+    await engine.runOnce();
+
+    expect(codex.triageRuns).toBe(1);
+    expect(codex.implementRuns).toBe(1);
+    expect(gh.comments.some((item) => item.includes(DEFAULT_TRIAGE_WORDING))).toBe(true);
+    expect(gh.comments.some((item) => item.includes("等待审批"))).toBe(true);
+    expect(gh.comments.some((item) => item.includes(DEFAULT_IMPLEMENT_WORDING))).toBe(true);
+    expect(gh.comments.some((item) => item.includes("Reason:\nvalid bug"))).toBe(false);
+    expect(gh.closed).toEqual([]);
+
+    const record = await runtime.getRecord("acme/web#170");
+    expect(record?.state).toBe("awaiting_approval");
+    expect(record?.summary).toBe("valid bug");
+    expect(record?.solution).toContain("Summary:");
+  });
+
+  it("starts implementation after approval comment without rerunning triage", async () => {
+    const repo = makeRepo("repo-a", "acme", "web");
+    const config = makeConfig([repo]);
+    config.global.planMode = true;
+    const gh = new FakeGitHubClient(
+      {
+        number: 171,
+        title: "approved issue",
+        body: "approved issue body",
+        html_url: "https://github.com/acme/web/issues/171"
+      },
+      [{ id: 901, body: "approve，按方案开始实现", created_at: "2026-02-28T00:00:00.000Z" }]
+    );
+
+    const runtime = new FakeRuntimeStore();
+    const issueKey = "acme/web#171";
+    await runtime.markSeen(issueKey);
+    await runtime.saveRecord({
+      issueKey,
+      repoId: repo.id,
+      issueNumber: 171,
+      state: "awaiting_approval",
+      summary: "triage reason from previous run",
+      prUrl: "",
+      rootCause: "old root cause",
+      solution: "Summary:\nold plan\n\nSolution:\nimplement in three steps",
+      closedAt: "",
+      threadTs: "",
+      lastExternalCommentId: 900,
+      updatedAt: new Date().toISOString()
+    });
+
+    const codex = new FakeCodexRunner(
+      { needs_processing: false, reason: "should not run triage" },
+      {
+        summary: "done",
+        root_cause: "cause",
+        solution: "solution",
+        pr_url: "https://github.com/acme/web/pull/171",
+        test_cases: []
+      }
+    );
+
+    const engine = new IssueEngine({
+      getConfig: async () => config,
+      runtimeStore: runtime,
+      githubFactory: () => gh,
+      codexFactory: () => codex,
+      notifierFactory: () => null,
+      writeBoard: async () => undefined,
+      writeRegressionCase: async () => undefined,
+      prepareWorkspace: async () => ({ contextFile: "/tmp/context.json", cleanup: async () => undefined })
+    });
+
+    await engine.runOnce();
+
+    expect(codex.triageRuns).toBe(0);
+    expect(codex.implementRuns).toBe(1);
+    expect(codex.lastImplementUserMessage).toContain("Approved design and implementation plan");
+    expect(gh.comments.some((item) => item.includes(DEFAULT_IMPLEMENT_WORDING))).toBe(true);
+    expect(gh.comments.some((item) => item.includes("PR:\nhttps://github.com/acme/web/pull/171"))).toBe(true);
   });
 
   it("uses one shared codex session per issue and stores latest session id", async () => {

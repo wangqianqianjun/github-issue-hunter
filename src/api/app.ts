@@ -26,7 +26,15 @@ interface BoardCardResponse {
   repoFullName: string;
   issueNumber: number;
   issueUrl: string;
-  state: "new" | "triaging" | "ignored" | "scheduled" | "implementing" | "completed" | "failed";
+  state:
+    | "new"
+    | "triaging"
+    | "ignored"
+    | "awaiting_approval"
+    | "scheduled"
+    | "implementing"
+    | "completed"
+    | "failed";
   summary: string;
   rootCause: string;
   solution: string;

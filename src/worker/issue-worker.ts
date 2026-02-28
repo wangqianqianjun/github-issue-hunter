@@ -17,7 +17,7 @@ interface WorkerArgs {
   repoId: string;
   issueNumber: number;
   issueKey: string;
-  triggerType: "new" | "retry_failed" | "new_comment" | "slack_signal" | "manual";
+  triggerType: "new" | "retry_failed" | "new_comment" | "slack_signal" | "approval" | "manual";
 }
 
 async function main(): Promise<void> {
@@ -150,7 +150,7 @@ function parseArgs(argv: string[]): WorkerArgs {
 }
 
 function isValidTriggerType(value: string): value is WorkerArgs["triggerType"] {
-  return ["new", "retry_failed", "new_comment", "slack_signal", "manual"].includes(value);
+  return ["new", "retry_failed", "new_comment", "slack_signal", "approval", "manual"].includes(value);
 }
 
 void main()
