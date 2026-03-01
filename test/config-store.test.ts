@@ -140,6 +140,37 @@ describe("ConfigStore", () => {
 
     const config = await store.load();
     expect(config.repositories[0].triageCommand).toBe(DEFAULT_TRIAGE_COMMAND);
-    expect(config.repositories[0].triageCommand).toContain("exactly two lines");
+    expect(config.repositories[0].triageCommand).toContain("exactly three lines");
+  });
+
+  it("migrates legacy two-line triage router command to next_step router default", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hunter-config-"));
+    const store = new ConfigStore(join(dir, "config.json"));
+
+    const oldTwoLineTriageCommand =
+      'codex exec --json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check --cd "{worktree}" "Read the issue context JSON file at {context_file}. You MUST inspect relevant code files and tests in the current repository before deciding. Use the current repository code as source of truth. You may use any tools/skills needed. Decide whether this issue should continue into engineering implementation right now. Output must be human-readable Chinese only, exactly two lines: 第一行: 决策: 是 或 决策: 否; 第二行: 原因: <一句话>. Do not output any other sections."';
+
+    await store.upsertRepository({
+      id: "repo-old-two-line-triage",
+      owner: "acme",
+      repo: "old-two-line-triage",
+      localPath: "/tmp/acme-old-two-line-triage",
+      triageCommand: oldTwoLineTriageCommand,
+      implementCommand: DEFAULT_IMPLEMENT_COMMAND,
+      triageWording: DEFAULT_TRIAGE_WORDING,
+      implementWording: DEFAULT_IMPLEMENT_WORDING,
+      ignoreWording: DEFAULT_IGNORE_WORDING,
+      enabled: true,
+      perRepoConcurrency: 1,
+      slack: {
+        enabled: false,
+        channelId: "",
+        transport: "none"
+      }
+    });
+
+    const config = await store.load();
+    expect(config.repositories[0].triageCommand).toBe(DEFAULT_TRIAGE_COMMAND);
+    expect(config.repositories[0].triageCommand).toContain("下一步");
   });
 });

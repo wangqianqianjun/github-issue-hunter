@@ -314,7 +314,7 @@ describe("IssueEngine", () => {
     expect(codex.triageRuns).toBe(1);
     expect(notifier.issueStarts).toHaveLength(1);
     expect(notifier.updates.every((item) => item.threadTs === notifier.threadTs)).toBe(true);
-    expect(notifier.updates.some((item) => item.text.includes("Issue 已进入评估阶段，开始 triage。"))).toBe(true);
+    expect(notifier.updates.some((item) => item.text.includes("Issue 已进入评估阶段，AI 将判断下一阶段。"))).toBe(true);
     expect(notifier.updates.some((item) => item.text.includes("推理进展: triage check"))).toBe(true);
     expect(notifier.updates.some((item) => item.text.includes("Triage 理由:"))).toBe(true);
     expect(notifier.updates.some((item) => item.text.includes("valid bug"))).toBe(true);
@@ -423,6 +423,67 @@ describe("IssueEngine", () => {
     expect(gh.comments.some((item) => item.includes(DEFAULT_TRIAGE_WORDING))).toBe(true);
     expect(gh.comments.some((item) => item.includes(DEFAULT_IGNORE_WORDING))).toBe(true);
     expect(gh.comments.some((item) => item.includes("原因:\nnot planned"))).toBe(true);
+  });
+
+  it("recovers stale in-flight issue when triaging state is outdated", async () => {
+    const previousStaleSeconds = process.env.ISSUE_HUNTER_STALE_IN_FLIGHT_RETRY_SECONDS;
+    process.env.ISSUE_HUNTER_STALE_IN_FLIGHT_RETRY_SECONDS = "60";
+
+    const repo = makeRepo("repo-a", "acme", "web");
+    const config = makeConfig([repo]);
+    const gh = new FakeGitHubClient({
+      number: 185,
+      title: "stale triaging",
+      body: "stale triaging",
+      html_url: "https://github.com/acme/web/issues/185"
+    });
+    const runtime = new FakeRuntimeStore();
+    const issueKey = "acme/web#185";
+    await runtime.markSeen(issueKey);
+    await runtime.saveRecord({
+      issueKey,
+      repoId: repo.id,
+      issueNumber: 185,
+      state: "triaging",
+      summary: "",
+      prUrl: "",
+      rootCause: "",
+      solution: "",
+      closedAt: "",
+      threadTs: "",
+      updatedAt: new Date(Date.now() - 5 * 60 * 1000).toISOString()
+    });
+
+    const codex = new FakeCodexRunner(
+      { needs_processing: false, reason: "already fixed" },
+      {}
+    );
+
+    const engine = new IssueEngine({
+      getConfig: async () => config,
+      runtimeStore: runtime,
+      githubFactory: () => gh,
+      codexFactory: () => codex,
+      notifierFactory: () => null,
+      writeBoard: async () => undefined,
+      writeRegressionCase: async () => undefined,
+      prepareWorkspace: async () => ({ contextFile: "/tmp/context.json", cleanup: async () => undefined })
+    });
+
+    try {
+      await engine.runOnce();
+    } finally {
+      if (previousStaleSeconds === undefined) {
+        delete process.env.ISSUE_HUNTER_STALE_IN_FLIGHT_RETRY_SECONDS;
+      } else {
+        process.env.ISSUE_HUNTER_STALE_IN_FLIGHT_RETRY_SECONDS = previousStaleSeconds;
+      }
+    }
+
+    const record = await runtime.getRecord(issueKey);
+    expect(codex.triageRuns).toBe(1);
+    expect(record?.state).toBe("ignored");
+    expect(record?.lastTriggerType).toBe("stale_recovery");
   });
 
   it("re-triages completed issue when new github comment appears", async () => {
@@ -635,7 +696,7 @@ describe("IssueEngine", () => {
     expect(record?.solution).toContain("Summary:");
   });
 
-  it("starts implementation after approval comment without rerunning triage", async () => {
+  it("enters implementation directly on explicit approval comment in awaiting_approval state", async () => {
     const repo = makeRepo("repo-a", "acme", "web");
     const config = makeConfig([repo]);
     config.global.planMode = true;
@@ -668,7 +729,7 @@ describe("IssueEngine", () => {
     });
 
     const codex = new FakeCodexRunner(
-      { needs_processing: false, reason: "should not run triage" },
+      { needs_processing: true, reason: "triage should not run in this case", next_step: "plan" },
       {
         summary: "done",
         root_cause: "cause",
@@ -693,9 +754,75 @@ describe("IssueEngine", () => {
 
     expect(codex.triageRuns).toBe(0);
     expect(codex.implementRuns).toBe(1);
-    expect(codex.lastImplementUserMessage).toContain("Approved design and implementation plan");
+    expect(codex.lastImplementUserMessage).toContain("approved");
+    expect(codex.lastImplementUserMessage).toContain("Approved plan summary");
     expect(gh.comments.some((item) => item.includes(DEFAULT_IMPLEMENT_WORDING))).toBe(true);
     expect(gh.comments.some((item) => item.includes("PR:\nhttps://github.com/acme/web/pull/171"))).toBe(true);
+  });
+
+  it("re-triages awaiting_approval issue on any new comment and keeps waiting when AI chooses plan", async () => {
+    const repo = makeRepo("repo-a", "acme", "web");
+    const config = makeConfig([repo]);
+    config.global.planMode = true;
+    const gh = new FakeGitHubClient(
+      {
+        number: 172,
+        title: "needs updated plan",
+        body: "issue body",
+        html_url: "https://github.com/acme/web/issues/172"
+      },
+      [{ id: 1001, body: "我并不满意，方案请继续调整", created_at: "2026-03-01T00:00:00.000Z" }]
+    );
+
+    const runtime = new FakeRuntimeStore();
+    const issueKey = "acme/web#172";
+    await runtime.markSeen(issueKey);
+    await runtime.saveRecord({
+      issueKey,
+      repoId: repo.id,
+      issueNumber: 172,
+      state: "awaiting_approval",
+      summary: "old plan summary",
+      prUrl: "",
+      rootCause: "old root cause",
+      solution: "old plan body",
+      closedAt: "",
+      threadTs: "",
+      lastExternalCommentId: 1000,
+      updatedAt: new Date().toISOString()
+    });
+
+    const codex = new FakeCodexRunner(
+      { needs_processing: true, reason: "needs revised plan", next_step: "plan" },
+      {
+        summary: "revised plan",
+        root_cause: "scope not aligned",
+        solution: "new staged design",
+        pr_url: "",
+        test_cases: []
+      }
+    );
+
+    const engine = new IssueEngine({
+      getConfig: async () => config,
+      runtimeStore: runtime,
+      githubFactory: () => gh,
+      codexFactory: () => codex,
+      notifierFactory: () => null,
+      writeBoard: async () => undefined,
+      writeRegressionCase: async () => undefined,
+      prepareWorkspace: async () => ({ contextFile: "/tmp/context.json", cleanup: async () => undefined })
+    });
+
+    await engine.runOnce();
+
+    expect(codex.triageRuns).toBe(1);
+    // plan mode uses implementation runner once to draft proposal
+    expect(codex.implementRuns).toBe(1);
+    const record = await runtime.getRecord(issueKey);
+    expect(record?.state).toBe("awaiting_approval");
+    expect(record?.summary).toContain("needs revised plan");
+    expect(gh.comments.some((item) => item.includes("等待审批"))).toBe(true);
   });
 
   it("uses one shared codex session per issue and stores latest session id", async () => {

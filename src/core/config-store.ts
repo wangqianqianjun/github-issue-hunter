@@ -41,7 +41,8 @@ const DEFAULT_CONFIG: AppConfig = {
     running: false,
     lastRunAt: "",
     lastError: "",
-    activeTasks: 0
+    activeTasks: 0,
+    lastHealthAt: ""
   }
 };
 
@@ -187,6 +188,14 @@ function isLegacyCodexSubcommand(command: string, subcommand: "triage" | "implem
 
 function isLegacyDefaultTriageCommand(command: string): boolean {
   const value = command.trim();
+  if (
+    value.includes("Output must be human-readable Chinese only, exactly two lines:") &&
+    value.includes("决策: 是 或 决策: 否") &&
+    value.includes("原因: <一句话>") &&
+    !value.includes("下一步")
+  ) {
+    return true;
+  }
   if (value.includes("Return Markdown with sections: ## Decision, ## Reason, ## Analysis, ## Evidence.")) {
     return true;
   }
