@@ -4,6 +4,7 @@ import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 
 import {
+  buildSocketEventDedupKey,
   extractSocketModeInboundMessage,
   isHumanSocketModeEvent,
   isStopCommand,
@@ -200,5 +201,19 @@ describe("ChatSlackBridge helpers", () => {
         }
       })
     ).toBe(false);
+  });
+
+  it("builds stable dedup key from envelope id when present", () => {
+    const key = buildSocketEventDedupKey({
+      envelopeId: "abc-123",
+      event: {
+        type: "message",
+        channel: "C1",
+        user: "U1",
+        ts: "1.1",
+        text: "hello"
+      }
+    });
+    expect(key).toBe("envelope:abc-123");
   });
 });

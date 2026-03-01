@@ -205,4 +205,62 @@ describe("SlackChannelCodexManager", () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  it("rejects switching issue binding inside one thread", async () => {
+    const root = await mkdtemp(join(tmpdir(), "issue-hunter-channel-issue-bind-"));
+    const prevBin = process.env.ISSUE_HUNTER_CODEX_BIN;
+    process.env.ISSUE_HUNTER_CODEX_BIN = "true";
+    try {
+      const repoRoot = join(root, "repo");
+      await mkdir(repoRoot, { recursive: true });
+      const repo = makeRepo(repoRoot);
+      const config = makeConfig(repo);
+      const configStore = {
+        load: async () => config
+      };
+
+      const runner = async (command: string, args: string[]) => {
+        if (command === "git" && args.includes("worktree") && args.includes("add")) {
+          const target = args[args.length - 2];
+          await mkdir(target, { recursive: true });
+        }
+        return { code: 0, stdout: "", stderr: "" };
+      };
+
+      const manager = new SlackChannelCodexManager(
+        configStore as never,
+        join(root, "runtime", "sessions.json"),
+        runner as never
+      );
+
+      const first = await manager.handleMessage({
+        threadId: "slack:C123:99.0",
+        channelId: "C123",
+        text: "第一次消息",
+        isMention: false,
+        issueKeyHint: "acme/web#185",
+        post: async () => undefined
+      });
+      expect(first.accepted).toBe(true);
+      await new Promise((resolve) => setTimeout(resolve, 40));
+
+      const second = await manager.handleMessage({
+        threadId: "slack:C123:99.0",
+        channelId: "C123",
+        text: "第二次消息",
+        isMention: false,
+        issueKeyHint: "acme/web#175",
+        post: async () => undefined
+      });
+      expect(second.accepted).toBe(true);
+      expect(second.message).toContain("已绑定");
+    } finally {
+      if (prevBin === undefined) {
+        delete process.env.ISSUE_HUNTER_CODEX_BIN;
+      } else {
+        process.env.ISSUE_HUNTER_CODEX_BIN = prevBin;
+      }
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });

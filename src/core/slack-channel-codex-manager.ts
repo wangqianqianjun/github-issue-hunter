@@ -17,6 +17,7 @@ interface ChannelSession {
   threadId: string;
   repoId: string;
   channelId: string;
+  issueKey: string;
   worktreePath: string;
   worktreeBranch: string;
   codexSessionId: string;
@@ -36,6 +37,7 @@ export interface ChannelMessageInput {
   post: (text: string) => Promise<void>;
   repoIdHint?: string;
   codexSessionIdHint?: string;
+  issueKeyHint?: string;
 }
 
 export interface ChannelMessageResult {
@@ -71,6 +73,16 @@ export class SlackChannelCodexManager {
 
     const config = await this.configStore.load();
     const existing = this.sessions.get(input.threadId);
+    const issueKeyHint = String(input.issueKeyHint || "").trim();
+    if (existing) {
+      const boundIssueKey = String(existing.issueKey || "").trim();
+      if (boundIssueKey && issueKeyHint && boundIssueKey !== issueKeyHint) {
+        return {
+          accepted: true,
+          message: `当前 thread 已绑定 ${boundIssueKey}，拒绝切换到 ${issueKeyHint}。请在原 issue 线程继续。`
+        };
+      }
+    }
     const repo = existing
       ? findRepoById(config, existing.repoId)
       : input.repoIdHint
@@ -121,6 +133,7 @@ export class SlackChannelCodexManager {
     }
 
     try {
+      const session = this.sessions.get(targetThread);
       child.kill("SIGTERM");
       setTimeout(() => {
         try {
@@ -133,7 +146,7 @@ export class SlackChannelCodexManager {
       }, 5000);
       return {
         stopped: true,
-        issueKey: "",
+        issueKey: String(session?.issueKey || ""),
         message: "已停止当前 thread 的频道 Codex 任务。"
       };
     } catch (error) {
@@ -164,12 +177,13 @@ export class SlackChannelCodexManager {
       repo,
       input.threadId,
       input.channelId,
-      String(input.codexSessionIdHint || "").trim()
+      String(input.codexSessionIdHint || "").trim(),
+      String(input.issueKeyHint || "").trim()
     );
     const batchIntervalMs =
       Math.max(5, Number(process.env.ISSUE_HUNTER_SLACK_BATCH_INTERVAL_SECONDS || 45)) * 1000;
     const postBatcher = createPostBatcher(input.post, batchIntervalMs);
-    const command = buildCodexCommand(session.worktreePath, session.codexSessionId, input.text);
+    const command = buildCodexCommand(session.worktreePath, session.codexSessionId, input.text, session.issueKey);
 
     const child = spawn(command.bin, command.args, {
       cwd: session.worktreePath,
@@ -280,13 +294,25 @@ export class SlackChannelCodexManager {
     repo: RepositoryConfig,
     threadId: string,
     channelId: string,
-    codexSessionIdHint: string
+    codexSessionIdHint: string,
+    issueKeyHint: string
   ): Promise<ChannelSession> {
     const existing = this.sessions.get(threadId);
     if (existing && existing.repoId === repo.id) {
+      const normalizedIssueKeyHint = String(issueKeyHint || "").trim();
+      const boundIssueKey = String(existing.issueKey || "").trim();
+      if (boundIssueKey && normalizedIssueKeyHint && boundIssueKey !== normalizedIssueKeyHint) {
+        throw new Error(`Thread ${threadId} is already bound to ${boundIssueKey}; cannot switch to ${normalizedIssueKeyHint}`);
+      }
       const hint = String(codexSessionIdHint || "").trim();
+      const shouldPersist = (!existing.codexSessionId && Boolean(hint)) || (!boundIssueKey && Boolean(normalizedIssueKeyHint));
       if (hint && !existing.codexSessionId) {
         existing.codexSessionId = hint;
+      }
+      if (!boundIssueKey && normalizedIssueKeyHint) {
+        existing.issueKey = normalizedIssueKeyHint;
+      }
+      if (shouldPersist) {
         existing.updatedAt = new Date().toISOString();
         this.sessions.set(threadId, existing);
         await this.persistSessions();
@@ -310,6 +336,7 @@ export class SlackChannelCodexManager {
       threadId,
       repoId: repo.id,
       channelId,
+      issueKey: String(issueKeyHint || "").trim(),
       worktreePath: plan.path,
       worktreeBranch: plan.branch,
       codexSessionId: String(codexSessionIdHint || "").trim(),
@@ -341,6 +368,7 @@ export class SlackChannelCodexManager {
           threadId,
           repoId,
           channelId: String(item.channelId || "").trim(),
+          issueKey: String(item.issueKey || "").trim(),
           worktreePath,
           worktreeBranch,
           codexSessionId: String(item.codexSessionId || "").trim(),
@@ -466,7 +494,12 @@ function findRepoById(config: AppConfig, repoId: string): RepositoryConfig | nul
   return config.repositories.find((repo) => repo.id === normalized && repo.enabled) ?? null;
 }
 
-function buildCodexCommand(worktreePath: string, sessionId: string, text: string): { bin: string; args: string[] } {
+function buildCodexCommand(
+  worktreePath: string,
+  sessionId: string,
+  text: string,
+  issueKey: string
+): { bin: string; args: string[] } {
   const args = [
     "exec",
     "--json",
@@ -479,7 +512,11 @@ function buildCodexCommand(worktreePath: string, sessionId: string, text: string
   if (resume) {
     args.push("resume", resume);
   }
-  args.push(text);
+  const guard = String(issueKey || "").trim()
+    ? `当前会话绑定 issue ${issueKey}。如果你的回答涉及其他 issue，请先指出冲突并停止执行。`
+    : "";
+  const finalText = [guard, String(text || "").trim()].filter(Boolean).join("\n\n");
+  args.push(finalText);
   return {
     bin: process.env.ISSUE_HUNTER_CODEX_BIN || "codex",
     args

@@ -22,6 +22,13 @@
   - 默认每 45 秒发送一批（可通过环境变量调整）
 - Context 文件不再写入仓库
   - issue 的 `context.json` 统一写入工作目录下的 `artifacts`，避免误提交到业务仓库
+- 稳定性增强（调度与连接）
+  - 新增 `GET /api/health`，返回服务状态、worker 心跳、Slack Socket 连接状态与错误统计
+  - worker 子进程增加心跳上报；超时会被主进程自动回收并标记可重试失败（`stale_recovery`）
+  - Slack Socket Mode 重连后自动触发 catch-up `runOnce`，降低断连窗口漏扫风险
+  - Slack Socket 事件增加去重缓存，避免重复事件导致重复触发
+  - `gh api` 调用增加指数退避重试，缓解短暂网络抖动（如 `connection reset by peer`）
+  - Slack 频道 thread 会话绑定 `issueKey`，拒绝跨 issue 复用，避免上下文串线
 
 ## 界面预览
 

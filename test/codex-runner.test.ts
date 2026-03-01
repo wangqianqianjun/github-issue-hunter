@@ -42,6 +42,7 @@ src/filter.ts
 
     expect(triage.needs_processing).toBe(true);
     expect(triage.reason).toContain("Null option");
+    expect(String(triage.next_step || "")).toBe("");
     expect(triage.markdown).toContain("## Decision");
   });
 
@@ -56,9 +57,25 @@ src/filter.ts
   });
 
   it("parses short chinese yes/no format", () => {
-    const triage = parseTriageFromOutput("决策: 是\n原因: 该问题可复现且尚未覆盖。");
+    const triage = parseTriageFromOutput("决策: 是\n原因: 该问题可复现且尚未覆盖。\n下一步: implement");
     expect(triage.needs_processing).toBe(true);
     expect(triage.reason).toContain("可复现");
+    expect(triage.next_step).toBe("implement");
+  });
+
+  it("parses next_step confirm from markdown section", () => {
+    const triage = parseTriageFromOutput(`
+## Decision
+needs_processing: true
+
+## Reason
+Need user confirmation before implementation.
+
+## NextStep
+confirm
+`);
+    expect(triage.needs_processing).toBe(true);
+    expect(triage.next_step).toBe("confirm");
   });
 });
 

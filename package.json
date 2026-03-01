@@ -8,6 +8,12 @@
     "dev": "tsx src/server.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/server.js",
+    "quickstart": "bash scripts/quickstart.sh",
+    "install:oneclick": "bash scripts/install.sh",
+    "service:start": "bash scripts/service.sh start",
+    "service:stop": "bash scripts/service.sh stop",
+    "service:restart": "bash scripts/service.sh restart",
+    "service:status": "bash scripts/service.sh status",
     "test": "vitest run",
     "test:watch": "vitest"
   },

@@ -17,11 +17,13 @@ interface WorkerArgs {
   repoId: string;
   issueNumber: number;
   issueKey: string;
-  triggerType: "new" | "retry_failed" | "new_comment" | "slack_signal" | "approval" | "manual";
+  triggerType: "new" | "retry_failed" | "new_comment" | "slack_signal" | "approval" | "manual" | "stale_recovery";
 }
 
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
+  const heartbeatIntervalMs =
+    Math.max(10, Number(process.env.ISSUE_HUNTER_WORKER_HEARTBEAT_INTERVAL_SECONDS || 30)) * 1000;
 
   const configStore = new ConfigStore(args.configPath);
   const stateRoot = resolve(dirname(args.configPath), "runtime");
@@ -84,6 +86,17 @@ async function main(): Promise<void> {
     engine.stopByIssueKey(args.issueKey);
   };
 
+  const sendHeartbeat = () => {
+    process.send?.({
+      type: "heartbeat",
+      issueKey: args.issueKey,
+      at: new Date().toISOString()
+    });
+  };
+  sendHeartbeat();
+  const heartbeatTimer = setInterval(sendHeartbeat, heartbeatIntervalMs);
+  heartbeatTimer.unref();
+
   process.on("message", (message: unknown) => {
     const payload = (message ?? {}) as Record<string, unknown>;
     if (payload.type !== "stop") {
@@ -110,8 +123,12 @@ async function main(): Promise<void> {
   process.on("SIGTERM", requestStop);
   process.on("SIGINT", requestStop);
 
-  await engine.runSpecificIssue(args.repoId, args.issueNumber, args.triggerType);
-  process.send?.({ type: "completed", issueKey: args.issueKey });
+  try {
+    await engine.runSpecificIssue(args.repoId, args.issueNumber, args.triggerType);
+    process.send?.({ type: "completed", issueKey: args.issueKey });
+  } finally {
+    clearInterval(heartbeatTimer);
+  }
 }
 
 function parseArgs(argv: string[]): WorkerArgs {
@@ -150,7 +167,7 @@ function parseArgs(argv: string[]): WorkerArgs {
 }
 
 function isValidTriggerType(value: string): value is WorkerArgs["triggerType"] {
-  return ["new", "retry_failed", "new_comment", "slack_signal", "approval", "manual"].includes(value);
+  return ["new", "retry_failed", "new_comment", "slack_signal", "approval", "manual", "stale_recovery"].includes(value);
 }
 
 void main()

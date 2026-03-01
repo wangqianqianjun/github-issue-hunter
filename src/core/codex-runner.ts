@@ -131,6 +131,7 @@ export function parseTriageFromOutput(output: string): Record<string, unknown> {
       return {
         needs_processing: shortDecision,
         reason: extractShortReasonLine(text),
+        next_step: extractShortNextStepLine(text),
         markdown: text
       };
     }
@@ -140,6 +141,11 @@ export function parseTriageFromOutput(output: string): Record<string, unknown> {
   return {
     needs_processing: needsProcessing,
     reason: extractMarkdownSection(text, "Reason") || extractShortReasonLine(text),
+    next_step:
+      extractMarkdownSection(text, "NextStep") ||
+      extractMarkdownSection(text, "Next Step") ||
+      extractMarkdownSection(text, "下一步") ||
+      extractShortNextStepLine(text),
     analysis: extractMarkdownSection(text, "Analysis"),
     evidence: extractMarkdownSection(text, "Evidence"),
     markdown: text
@@ -463,11 +469,13 @@ async function runShell(
 function normalizeTriagePayload(payload: Record<string, unknown>, markdown: string): Record<string, unknown> {
   const needsProcessing =
     parseNeedsProcessingValue(payload.needs_processing) ?? parseNeedsProcessingValue(payload.needsProcessing) ?? false;
+  const nextStep = parseNextStepValue(payload.next_step ?? payload.nextStep ?? payload.action);
 
   return {
     ...payload,
     needs_processing: needsProcessing,
     reason: String(payload.reason ?? "").trim(),
+    next_step: nextStep || String(payload.next_step ?? payload.nextStep ?? payload.action ?? "").trim(),
     markdown
   };
 }
@@ -506,12 +514,18 @@ function parseNeedsProcessingValue(value: unknown): boolean | null {
 
 function extractMarkdownSection(markdown: string, heading: string): string {
   const escaped = escapeRegExp(heading);
-  const pattern = new RegExp(`^##+\\s*${escaped}\\s*$([\\s\\S]*?)(?=^##+\\s+|\\Z)`, "im");
-  const match = markdown.match(pattern);
-  if (!match) {
+  const headingPattern = new RegExp(`^##+\\s*${escaped}\\s*$`, "im");
+  const headingMatch = headingPattern.exec(markdown);
+  if (!headingMatch || headingMatch.index < 0) {
     return "";
   }
-  return match[1].trim();
+  const start = headingMatch.index + headingMatch[0].length;
+  const remainder = markdown.slice(start);
+  const nextHeadingMatch = /^\s*##+\s+\S.*$/im.exec(remainder);
+  if (!nextHeadingMatch || nextHeadingMatch.index === undefined || nextHeadingMatch.index < 0) {
+    return remainder.trim();
+  }
+  return remainder.slice(0, nextHeadingMatch.index).trim();
 }
 
 function extractMarkdownSectionAny(markdown: string, headings: string[]): string {
@@ -567,6 +581,76 @@ function extractShortReasonLine(text: string): string {
   }
 
   return line.replace(/^(原因|reason)\s*[:：]\s*/i, "").trim();
+}
+
+function extractShortNextStepLine(text: string): string {
+  const line = text
+    .split(/\r?\n/)
+    .map((item) => item.trim())
+    .find((item) => /^(下一步|next[\s_-]*step|action)\s*[:：]/i.test(item));
+
+  if (!line) {
+    return "";
+  }
+
+  const raw = line.replace(/^(下一步|next[\s_-]*step|action)\s*[:：]\s*/i, "").trim();
+  return parseNextStepValue(raw) || raw;
+}
+
+function parseNextStepValue(value: unknown): "implement" | "plan" | "confirm" | "ignore" | "" {
+  const text = String(value ?? "").trim().toLowerCase();
+  if (!text) {
+    return "";
+  }
+
+  if (
+    text === "implement" ||
+    text === "execute" ||
+    text === "process" ||
+    text.includes("开始实现") ||
+    text.includes("进入开发") ||
+    text.includes("处理")
+  ) {
+    return "implement";
+  }
+
+  if (
+    text === "plan" ||
+    text === "design" ||
+    text === "update" ||
+    text === "update_plan" ||
+    text === "await_approval" ||
+    text === "awaiting_approval" ||
+    text.includes("等待审批") ||
+    text.includes("设计") ||
+    text.includes("更新方案") ||
+    text.includes("先出方案")
+  ) {
+    return "plan";
+  }
+
+  if (
+    text === "confirm" ||
+    text === "await_confirm" ||
+    text === "awaiting_confirm" ||
+    text.includes("等待确认") ||
+    text.includes("待确认")
+  ) {
+    return "confirm";
+  }
+
+  if (
+    text === "ignore" ||
+    text === "skip" ||
+    text === "no_action" ||
+    text.includes("不处理") ||
+    text.includes("暂不处理") ||
+    text.includes("忽略")
+  ) {
+    return "ignore";
+  }
+
+  return "";
 }
 
 function extractLabeledValue(text: string, labels: string[]): string {

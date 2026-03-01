@@ -10,7 +10,7 @@ import { FileRuntimeStore } from "./runtime-store.js";
 import { GhCliClient } from "../clients/gh-cli-client.js";
 import { CodexRunner } from "./codex-runner.js";
 import { DirectSlackNotifier, ChatSdkNotifier } from "../chat/notifiers.js";
-import { ChatSlackBridge } from "../chat/vercel-chat-bridge.js";
+import { ChatSlackBridge, type SlackBridgeHealthSnapshot } from "../chat/vercel-chat-bridge.js";
 import { WorkspaceManager } from "./workspace-manager.js";
 import { writeRegressionCase } from "./report-writer.js";
 import type { AppConfig, IssueExecutionRecord, RepositoryConfig } from "../types/config.js";
@@ -25,6 +25,7 @@ interface ServiceStatus {
   queueLength: number;
   lastRunAt: string;
   lastError: string;
+  lastHealthAt?: string;
 }
 
 export interface BoardCard {
@@ -102,13 +103,16 @@ interface RunningWorker {
   issueNumber: number;
   startedAt: string;
   threadTokens: Set<string>;
+  lastHeartbeatAtMs: number;
+  lastMessageAtMs: number;
+  forcedTerminationReason?: string;
 }
 
 interface WorkerTask {
   repo: RepositoryConfig;
   issueNumber: number;
   issueKey: string;
-  triggerType: "new" | "retry_failed" | "new_comment" | "slack_signal" | "approval" | "manual";
+  triggerType: "new" | "retry_failed" | "new_comment" | "slack_signal" | "approval" | "manual" | "stale_recovery";
 }
 
 interface WorkerMessage {
@@ -117,12 +121,64 @@ interface WorkerMessage {
   threadToken?: string;
   stopped?: boolean;
   message?: string;
+  at?: string;
+}
+
+interface ServiceHealthStatus {
+  now: string;
+  service: ServiceStatus & {
+    runOnceInFlight: boolean;
+    schedulerTickLagMs: number;
+  };
+  workers: {
+    active: number;
+    stale: number;
+    heartbeatTimeoutSeconds: number;
+    items: Array<{
+      issueKey: string;
+      repoId: string;
+      issueNumber: number;
+      startedAt: string;
+      lastHeartbeatAt: string;
+      lastMessageAt: string;
+      forcedTerminationReason: string;
+    }>;
+  };
+  slack: SlackBridgeHealthSnapshot;
+  scans: {
+    repositoryScanErrorTotal: number;
+    repositoryScanErrorByCategory: Record<string, number>;
+    lastRepositoryScanErrorAt: string;
+    lastRepositoryScanError: string;
+  };
+  counters: {
+    runCycles: number;
+    runFailures: number;
+    workerFailures: number;
+    reconnectRecoveries: number;
+  };
 }
 
 export class IssueHunterService {
   private timer: NodeJS.Timeout | null = null;
   private runOnceInFlight: Promise<void> | null = null;
   private lastSchedulerTickMs = 0;
+  private lastSocketReconnectRecoveryAtMs = 0;
+  private runCycles = 0;
+  private runFailures = 0;
+  private workerFailures = 0;
+  private reconnectRecoveries = 0;
+  private lastSummaryLogAtMs = 0;
+  private repositoryScanErrorTotal = 0;
+  private readonly repositoryScanErrorByCategory: Record<string, number> = {
+    transient: 0,
+    logic: 0,
+    config: 0,
+    cancelled: 0,
+    unknown: 0
+  };
+  private lastRepositoryScanErrorAt = "";
+  private lastRepositoryScanError = "";
   private readonly runtimeStore: FileRuntimeStore;
   private readonly chatBridge: ChatSlackBridge;
   private readonly slackChannelCodexManager: SlackChannelCodexManager;
@@ -162,7 +218,8 @@ export class IssueHunterService {
       async () => this.getStatus(),
       async (threadId) => this.stopByThread(threadId),
       async (threadId, text) => this.registerSlackSignal(threadId, text),
-      async (input) => this.handleSlackChannelMessage(input)
+      async (input) => this.handleSlackChannelMessage(input),
+      async () => this.handleSocketModeReconnected()
     );
 
     // Scheduler-only engine: it discovers pending issues and dispatches workers.
@@ -182,6 +239,7 @@ export class IssueHunterService {
           defaultWorkingDirectory: process.cwd()
         }),
       notifierFactory: () => null,
+      onRepositoryScanError: async (input) => this.onRepositoryScanError(input),
       externalTaskExecutor: async (task) => this.dispatchWorker(task),
       writeBoard: async () => undefined,
       writeRegressionCase: async () => undefined
@@ -199,10 +257,12 @@ export class IssueHunterService {
     const intervalMs = Math.max(5, Number(config.global.pollIntervalSeconds || 30)) * 1000;
 
     this.status.running = true;
+    this.status.lastHealthAt = new Date().toISOString();
     await this.configStore.updateServiceState({
       running: true,
       lastError: "",
-      activeTasks: this.workersByIssueKey.size
+      activeTasks: this.workersByIssueKey.size,
+      lastHealthAt: this.status.lastHealthAt
     });
 
     await this.runOnceSafe().catch(() => undefined);
@@ -245,10 +305,12 @@ export class IssueHunterService {
     }
 
     this.status.running = false;
+    this.status.lastHealthAt = new Date().toISOString();
     await this.chatBridge.shutdown().catch(() => undefined);
     await this.configStore.updateServiceState({
       running: false,
-      activeTasks: this.workersByIssueKey.size
+      activeTasks: this.workersByIssueKey.size,
+      lastHealthAt: this.status.lastHealthAt
     });
   }
 
@@ -269,9 +331,64 @@ export class IssueHunterService {
       activeTasks: this.workersByIssueKey.size,
       lastRunAt: this.status.lastRunAt || config.serviceState.lastRunAt,
       lastError: this.status.lastError || config.serviceState.lastError,
+      lastHealthAt: this.status.lastHealthAt || config.serviceState.lastHealthAt || "",
       queueLength: 0
     };
     return merged;
+  }
+
+  async getHealthStatus(): Promise<ServiceHealthStatus> {
+    const status = await this.getStatus();
+    const now = Date.now();
+    const heartbeatTimeoutSeconds = getWorkerHeartbeatTimeoutSeconds();
+    const staleBoundaryMs = heartbeatTimeoutSeconds * 1000;
+    let staleCount = 0;
+
+    const workers = [...this.workersByIssueKey.values()].map((worker) => {
+      const lastHeartbeatAtMs = worker.lastHeartbeatAtMs || Date.parse(worker.startedAt) || 0;
+      const lastMessageAtMs = worker.lastMessageAtMs || Date.parse(worker.startedAt) || 0;
+      const baseline = Math.max(lastHeartbeatAtMs, lastMessageAtMs);
+      if (baseline > 0 && now - baseline >= staleBoundaryMs) {
+        staleCount += 1;
+      }
+      return {
+        issueKey: worker.issueKey,
+        repoId: worker.repoId,
+        issueNumber: worker.issueNumber,
+        startedAt: worker.startedAt,
+        lastHeartbeatAt: lastHeartbeatAtMs > 0 ? new Date(lastHeartbeatAtMs).toISOString() : "",
+        lastMessageAt: lastMessageAtMs > 0 ? new Date(lastMessageAtMs).toISOString() : "",
+        forcedTerminationReason: String(worker.forcedTerminationReason || "")
+      };
+    });
+
+    return {
+      now: new Date(now).toISOString(),
+      service: {
+        ...status,
+        runOnceInFlight: Boolean(this.runOnceInFlight),
+        schedulerTickLagMs: this.lastSchedulerTickMs ? Math.max(0, now - this.lastSchedulerTickMs) : 0
+      },
+      workers: {
+        active: workers.length,
+        stale: staleCount,
+        heartbeatTimeoutSeconds,
+        items: workers
+      },
+      slack: this.chatBridge.getHealthSnapshot(),
+      scans: {
+        repositoryScanErrorTotal: this.repositoryScanErrorTotal,
+        repositoryScanErrorByCategory: { ...this.repositoryScanErrorByCategory },
+        lastRepositoryScanErrorAt: this.lastRepositoryScanErrorAt,
+        lastRepositoryScanError: this.lastRepositoryScanError
+      },
+      counters: {
+        runCycles: this.runCycles,
+        runFailures: this.runFailures,
+        workerFailures: this.workerFailures,
+        reconnectRecoveries: this.reconnectRecoveries
+      }
+    };
   }
 
   async handleSlackWebhook(request: import("express").Request, response: import("express").Response): Promise<void> {
@@ -538,10 +655,13 @@ export class IssueHunterService {
 
     this.runOnceInFlight = (async () => {
       try {
+        await this.inspectWorkerHeartbeats();
         await this.engine.runOnce();
+        this.runCycles += 1;
         this.status.lastRunAt = new Date().toISOString();
         this.status.lastError = "";
       } catch (error) {
+        this.runFailures += 1;
         const message = error instanceof Error ? error.message : String(error);
         this.status.lastError = message;
 
@@ -549,17 +669,21 @@ export class IssueHunterService {
           lastError: message,
           lastRunAt: new Date().toISOString(),
           running: Boolean(this.timer),
-          activeTasks: this.workersByIssueKey.size
+          activeTasks: this.workersByIssueKey.size,
+          lastHealthAt: new Date().toISOString()
         });
 
         throw error;
       } finally {
         this.status.activeTasks = this.workersByIssueKey.size;
+        this.status.lastHealthAt = new Date().toISOString();
+        this.maybeLogHealthSummary();
         await this.configStore.updateServiceState({
           running: Boolean(this.timer),
           lastRunAt: this.status.lastRunAt,
           lastError: this.status.lastError,
-          activeTasks: this.workersByIssueKey.size
+          activeTasks: this.workersByIssueKey.size,
+          lastHealthAt: this.status.lastHealthAt
         });
       }
     })();
@@ -569,6 +693,111 @@ export class IssueHunterService {
     } finally {
       this.runOnceInFlight = null;
     }
+  }
+
+  private async onRepositoryScanError(input: {
+    repo: RepositoryConfig;
+    error: string;
+    category: "transient" | "logic" | "config" | "cancelled" | "unknown";
+    retryEligible: boolean;
+  }): Promise<void> {
+    const category = String(input.category || "unknown").trim() as keyof typeof this.repositoryScanErrorByCategory;
+    if (category in this.repositoryScanErrorByCategory) {
+      this.repositoryScanErrorByCategory[category] += 1;
+    } else {
+      this.repositoryScanErrorByCategory.unknown += 1;
+    }
+    this.repositoryScanErrorTotal += 1;
+    this.lastRepositoryScanErrorAt = new Date().toISOString();
+    this.lastRepositoryScanError = `${input.repo.owner}/${input.repo.repo}: ${input.error}`;
+
+    const retryHint = input.retryEligible ? "retry=true" : "retry=false";
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[issue-hunter] repository scan error repo=${input.repo.owner}/${input.repo.repo} category=${category} ${retryHint} detail=${input.error}`
+    );
+  }
+
+  private async handleSocketModeReconnected(): Promise<void> {
+    const throttleMs = Math.max(
+      5_000,
+      Number(process.env.ISSUE_HUNTER_SOCKET_RECONNECT_CATCHUP_THROTTLE_MS || 20_000)
+    );
+    const now = Date.now();
+    if (this.lastSocketReconnectRecoveryAtMs > 0 && now - this.lastSocketReconnectRecoveryAtMs < throttleMs) {
+      return;
+    }
+    this.lastSocketReconnectRecoveryAtMs = now;
+    this.reconnectRecoveries += 1;
+    // eslint-disable-next-line no-console
+    console.info("[issue-hunter] Socket Mode reconnected. Triggering catch-up runOnce.");
+    await this.runOnceSafe().catch((error) => {
+      const detail = error instanceof Error ? error.message : String(error);
+      // eslint-disable-next-line no-console
+      console.warn(`[issue-hunter] catch-up runOnce after reconnect failed: ${detail}`);
+    });
+  }
+
+  private async inspectWorkerHeartbeats(): Promise<void> {
+    if (!this.workersByIssueKey.size) {
+      return;
+    }
+    const timeoutSeconds = getWorkerHeartbeatTimeoutSeconds();
+    const timeoutMs = timeoutSeconds * 1000;
+    const now = Date.now();
+    for (const worker of this.workersByIssueKey.values()) {
+      const startedAtMs = Date.parse(worker.startedAt);
+      const baseline = Math.max(
+        worker.lastHeartbeatAtMs || 0,
+        worker.lastMessageAtMs || 0,
+        Number.isFinite(startedAtMs) ? startedAtMs : 0
+      );
+      if (!baseline) {
+        continue;
+      }
+      if (now - baseline < timeoutMs) {
+        continue;
+      }
+      if (worker.forcedTerminationReason) {
+        continue;
+      }
+
+      worker.forcedTerminationReason = `Issue worker heartbeat timeout (${worker.issueKey}, timeout=${timeoutSeconds}s)`;
+      // eslint-disable-next-line no-console
+      console.warn(`[issue-hunter] ${worker.forcedTerminationReason}`);
+      try {
+        worker.child.kill("SIGTERM");
+      } catch {
+        // Ignore termination race and rely on exit handler.
+      }
+      setTimeout(() => {
+        try {
+          if (!worker.child.killed) {
+            worker.child.kill("SIGKILL");
+          }
+        } catch {
+          // Ignore kill escalation errors.
+        }
+      }, 5000);
+    }
+  }
+
+  private maybeLogHealthSummary(): void {
+    const now = Date.now();
+    const summaryIntervalMs = Math.max(10_000, Number(process.env.ISSUE_HUNTER_HEALTH_LOG_INTERVAL_MS || 60_000));
+    if (now - this.lastSummaryLogAtMs < summaryIntervalMs) {
+      return;
+    }
+    this.lastSummaryLogAtMs = now;
+    const slack = this.chatBridge.getHealthSnapshot();
+    // eslint-disable-next-line no-console
+    console.info(
+      "[issue-hunter][health] " +
+        `running=${Boolean(this.timer)} activeWorkers=${this.workersByIssueKey.size} runCycles=${this.runCycles} ` +
+        `runFailures=${this.runFailures} workerFailures=${this.workerFailures} ` +
+        `repoScanErrors=${this.repositoryScanErrorTotal} socketConnected=${slack.socketModeConnected} ` +
+        `socketReconnects=${slack.reconnectCount} duplicateEventsDropped=${slack.duplicateEventsDropped}`
+    );
   }
 
   private async stopByThread(threadToken: string): Promise<{ stopped: boolean; issueKey: string; message: string }> {
@@ -846,9 +1075,11 @@ export class IssueHunterService {
   }): Promise<ChannelMessageResult> {
     let repoIdHint = "";
     let codexSessionIdHint = "";
+    let issueKeyHint = "";
 
     const issueKey = await this.resolveIssueKeyByThreadToken(input.threadId);
     if (issueKey) {
+      issueKeyHint = issueKey;
       const record = await this.runtimeStore.getRecord(issueKey);
       if (record) {
         repoIdHint = String(record.repoId || "").trim();
@@ -876,14 +1107,36 @@ export class IssueHunterService {
       isMention: input.isMention,
       post: input.post,
       repoIdHint,
-      codexSessionIdHint
+      codexSessionIdHint,
+      issueKeyHint
     });
     return result;
   }
 
   private async dispatchWorker(task: WorkerTask): Promise<void> {
-    if (this.workersByIssueKey.has(task.issueKey)) {
+    const nowIso = new Date().toISOString();
+    const activeWorker = this.workersByIssueKey.get(task.issueKey);
+    if (activeWorker) {
+      activeWorker.lastMessageAtMs = Date.now();
+      activeWorker.lastHeartbeatAtMs = Date.now();
+      const activeRecord = await this.runtimeStore.getRecord(task.issueKey);
+      if (activeRecord) {
+        await this.runtimeStore.saveRecord({
+          ...activeRecord,
+          lastWorkerHeartbeatAt: nowIso,
+          lastTriggerType: task.triggerType
+        });
+      }
       return;
+    }
+
+    const preDispatchRecord = await this.runtimeStore.getRecord(task.issueKey);
+    if (preDispatchRecord) {
+      await this.runtimeStore.saveRecord({
+        ...preDispatchRecord,
+        lastWorkerHeartbeatAt: nowIso,
+        lastTriggerType: task.triggerType
+      });
     }
 
     const command = resolveWorkerCommand();
@@ -903,7 +1156,10 @@ export class IssueHunterService {
       repoId: task.repo.id,
       issueNumber: task.issueNumber,
       startedAt: new Date().toISOString(),
-      threadTokens: new Set<string>()
+      threadTokens: new Set<string>(),
+      lastHeartbeatAtMs: Date.now(),
+      lastMessageAtMs: Date.now(),
+      forcedTerminationReason: ""
     };
 
     this.workersByIssueKey.set(task.issueKey, worker);
@@ -931,6 +1187,7 @@ export class IssueHunterService {
     if (!message || typeof message !== "object") {
       return;
     }
+    worker.lastMessageAtMs = Date.now();
 
     const type = String(message.type || "");
     if (type === "thread_registered") {
@@ -952,7 +1209,7 @@ export class IssueHunterService {
 
     if (type === "failed") {
       const detail = String(message.message || "Worker execution failed").trim();
-      await this.markIssueFailedIfNeeded(worker, detail);
+      await this.markIssueFailedIfNeeded(worker, detail, classifyServiceFailure(detail));
       this.status.lastError = detail;
       await this.configStore.updateServiceState({
         lastError: detail,
@@ -964,6 +1221,21 @@ export class IssueHunterService {
 
     if (type === "stop_ack") {
       // Informational only. The worker will eventually exit and update runtime state.
+      return;
+    }
+
+    if (type === "heartbeat") {
+      const atRaw = String(message.at || "").trim();
+      const atMs = Date.parse(atRaw);
+      const atIso = Number.isFinite(atMs) ? new Date(atMs).toISOString() : new Date().toISOString();
+      worker.lastHeartbeatAtMs = Date.parse(atIso);
+      const current = await this.runtimeStore.getRecord(worker.issueKey);
+      if (current) {
+        await this.runtimeStore.saveRecord({
+          ...current,
+          lastWorkerHeartbeatAt: atIso
+        });
+      }
       return;
     }
   }
@@ -983,9 +1255,19 @@ export class IssueHunterService {
     this.workersByIssueKey.delete(worker.issueKey);
     this.unregisterThreadAliases(worker);
 
-    if (code !== 0 && code !== 130) {
-      const detail = `Issue worker exited unexpectedly (${worker.issueKey}, code=${code}, signal=${signal || "none"})`;
-      await this.markIssueFailedIfNeeded(worker, detail);
+    const forcedTermination = Boolean(String(worker.forcedTerminationReason || "").trim());
+    if ((code !== 0 && code !== 130) || forcedTermination) {
+      this.workerFailures += 1;
+      const detail =
+        String(worker.forcedTerminationReason || "").trim() ||
+        `Issue worker exited unexpectedly (${worker.issueKey}, code=${code}, signal=${signal || "none"})`;
+      await this.markIssueFailedIfNeeded(
+        worker,
+        detail,
+        worker.forcedTerminationReason
+          ? { category: "transient", retryEligible: true }
+          : classifyServiceFailure(detail)
+      );
       this.status.lastError = detail;
       await this.configStore.updateServiceState({
         lastError: detail,
@@ -1001,7 +1283,11 @@ export class IssueHunterService {
     });
   }
 
-  private async markIssueFailedIfNeeded(worker: RunningWorker, detail: string): Promise<void> {
+  private async markIssueFailedIfNeeded(
+    worker: RunningWorker,
+    detail: string,
+    failure?: { category: "transient" | "logic" | "config" | "cancelled" | "unknown"; retryEligible: boolean }
+  ): Promise<void> {
     const current = await this.runtimeStore.getRecord(worker.issueKey);
     if (current && (current.state === "completed" || current.state === "ignored" || current.state === "failed")) {
       return;
@@ -1018,6 +1304,8 @@ export class IssueHunterService {
       solution: "",
       closedAt: "",
       threadTs: current?.threadTs || "",
+      failureCategory: failure?.category,
+      failureRetryEligible: failure?.retryEligible,
       updatedAt: new Date().toISOString()
     };
 
@@ -1026,6 +1314,9 @@ export class IssueHunterService {
         ...current,
         state: "failed",
         summary: current.summary || detail,
+        failureCategory: current.failureCategory || failure?.category,
+        failureRetryEligible:
+          typeof current.failureRetryEligible === "boolean" ? current.failureRetryEligible : failure?.retryEligible,
         updatedAt: fallbackRecord.updatedAt
       });
       return;
@@ -1097,7 +1388,7 @@ function parseRegressionCaseMarkdown(content: string): {
 
 function extractMarkdownSection(text: string, heading: string): string {
   const escaped = heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const pattern = new RegExp(`^##\\s+${escaped}\\s*\\n([\\s\\S]*?)(?=^##\\s+|\\Z)`, "m");
+  const pattern = new RegExp(`^##\\s+${escaped}\\s*\\n([\\s\\S]*?)(?=^##\\s+|$)`, "m");
   const match = text.match(pattern);
   return String(match?.[1] || "").trim();
 }
@@ -1265,6 +1556,54 @@ function resolveSlackCredential(
   }
 
   return process.env[envName] ?? "";
+}
+
+function getWorkerHeartbeatTimeoutSeconds(): number {
+  return Math.max(60, Number(process.env.ISSUE_HUNTER_WORKER_HEARTBEAT_TIMEOUT_SECONDS || 900));
+}
+
+function classifyServiceFailure(message: string): {
+  category: "transient" | "logic" | "config" | "cancelled" | "unknown";
+  retryEligible: boolean;
+} {
+  const text = String(message || "").toLowerCase();
+  if (!text) {
+    return { category: "unknown", retryEligible: false };
+  }
+
+  if (
+    text.includes("timeout") ||
+    text.includes("timed out") ||
+    text.includes("econnreset") ||
+    text.includes("connection reset") ||
+    text.includes("tls handshake") ||
+    text.includes("socket hang up") ||
+    text.includes("http 502") ||
+    text.includes("http 503") ||
+    text.includes("http 504")
+  ) {
+    return { category: "transient", retryEligible: true };
+  }
+
+  if (
+    text.includes("not authenticated") ||
+    text.includes("invalid token") ||
+    text.includes("forbidden") ||
+    text.includes("permission denied") ||
+    text.includes("gh auth status")
+  ) {
+    return { category: "config", retryEligible: false };
+  }
+
+  if (text.includes("cancelled by stop request") || text.includes("cancelled by stop command")) {
+    return { category: "cancelled", retryEligible: false };
+  }
+
+  if (text.includes("cannot parse") || text.includes("json") || text.includes("workflow violation")) {
+    return { category: "logic", retryEligible: false };
+  }
+
+  return { category: "unknown", retryEligible: false };
 }
 
 // Worker-side helper for consistency between scheduler and worker implementations.

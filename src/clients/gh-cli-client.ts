@@ -132,23 +132,43 @@ export class GhCliClient implements GitHubClientLike {
   }
 
   private async runGhJson(args: string[]): Promise<unknown> {
-    let result: CommandResult;
-    try {
-      result = await this.commandRunner("gh", args, { cwd: this.options.localPath });
-    } catch (error) {
-      throw new Error(
-        `Failed to run gh command. Ensure GitHub CLI is installed and available in PATH. Original error: ${String(error)}`
-      );
-    }
-    if (result.code !== 0) {
-      throw new Error(`gh command failed: ${result.stderr || result.stdout}. Run 'gh auth status' in this repository.`);
+    const maxAttempts = Math.max(1, Number(process.env.ISSUE_HUNTER_GH_API_MAX_ATTEMPTS || 6));
+    let lastError = "";
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      let result: CommandResult;
+      try {
+        result = await this.commandRunner("gh", args, { cwd: this.options.localPath });
+      } catch (error) {
+        lastError = `Failed to run gh command. Ensure GitHub CLI is installed and available in PATH. Original error: ${String(error)}`;
+        if (attempt < maxAttempts && isRetryableGhError(lastError)) {
+          await sleep(backoffMs(attempt));
+          continue;
+        }
+        throw new Error(lastError);
+      }
+
+      if (result.code !== 0) {
+        lastError = `gh command failed: ${result.stderr || result.stdout}. Run 'gh auth status' in this repository.`;
+        if (attempt < maxAttempts && isRetryableGhError(lastError)) {
+          await sleep(backoffMs(attempt));
+          continue;
+        }
+        throw new Error(lastError);
+      }
+
+      try {
+        return JSON.parse(result.stdout);
+      } catch (error) {
+        lastError = `Failed to parse gh JSON output: ${String(error)}; output=${result.stdout}`;
+        if (attempt < maxAttempts && isRetryableGhError(lastError)) {
+          await sleep(backoffMs(attempt));
+          continue;
+        }
+        throw new Error(lastError);
+      }
     }
 
-    try {
-      return JSON.parse(result.stdout);
-    } catch (error) {
-      throw new Error(`Failed to parse gh JSON output: ${String(error)}; output=${result.stdout}`);
-    }
+    throw new Error(lastError || "gh command failed with unknown error");
   }
 
   private async tryGetGhToken(): Promise<string> {
@@ -162,4 +182,38 @@ export class GhCliClient implements GitHubClientLike {
       return "";
     }
   }
+}
+
+function isRetryableGhError(message: string): boolean {
+  const text = String(message || "").toLowerCase();
+  if (!text) {
+    return false;
+  }
+  return (
+    text.includes("eof") ||
+    text.includes("timeout") ||
+    text.includes("timed out") ||
+    text.includes("etimedout") ||
+    text.includes("econnreset") ||
+    text.includes("connection reset by peer") ||
+    text.includes("reset by peer") ||
+    text.includes("read tcp") ||
+    text.includes("enotfound") ||
+    text.includes("temporary failure") ||
+    text.includes("tls handshake timeout") ||
+    text.includes("http 502") ||
+    text.includes("http 503") ||
+    text.includes("http 504")
+  );
+}
+
+function backoffMs(attempt: number): number {
+  const base = Math.max(100, Number(process.env.ISSUE_HUNTER_GH_API_RETRY_BASE_MS || 400));
+  const exp = Math.pow(2, Math.max(0, attempt - 1));
+  const jitter = 0.75 + Math.random() * 0.5;
+  return Math.min(12_000, Math.floor(base * exp * jitter));
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

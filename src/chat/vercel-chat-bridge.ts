@@ -48,6 +48,18 @@ export interface ChannelMessageProvider {
   }): Promise<ChannelMessageResult>;
 }
 
+export interface SlackBridgeHealthSnapshot {
+  socketModeEnabled: boolean;
+  socketModeConnected: boolean;
+  lastConnectedAt: string;
+  lastDisconnectedAt: string;
+  reconnectCount: number;
+  duplicateEventsDropped: number;
+  processedHumanEvents: number;
+  lastSocketError: string;
+  lastSocketErrorAt: string;
+}
+
 export class ChatSlackBridge {
   private chat: Chat<{ slack: SlackAdapter }> | null = null;
   private slackAdapter: SlackAdapter | null = null;
@@ -63,14 +75,43 @@ export class ChatSlackBridge {
   private botId = "";
   private socketModeLastConnectedAt = 0;
   private socketModeLastDisconnectedAt = 0;
+  private socketModeConnected = false;
+  private socketModeReconnectCount = 0;
+  private ignoredSelfEventCount = 0;
+  private ignoredNonHumanEventCount = 0;
+  private lastIgnoredSelfLogAt = 0;
+  private lastIgnoredNonHumanLogAt = 0;
+  private readonly socketEventDedup = new Map<string, number>();
+  private duplicateSocketEventCount = 0;
+  private lastDuplicateSocketEventLogAt = 0;
+  private processedHumanEventCount = 0;
+  private lastSocketError = "";
+  private lastSocketErrorAt = 0;
 
   constructor(
     private readonly configStore: ConfigStore,
     private readonly statusProvider: ServiceStatusProvider,
     private readonly stopProvider?: ThreadStopProvider,
     private readonly signalProvider?: ThreadSignalProvider,
-    private readonly channelMessageProvider?: ChannelMessageProvider
+    private readonly channelMessageProvider?: ChannelMessageProvider,
+    private readonly onSocketModeReconnected?: () => Promise<void> | void
   ) {}
+
+  getHealthSnapshot(): SlackBridgeHealthSnapshot {
+    return {
+      socketModeEnabled: this.socketModeEnabled,
+      socketModeConnected: this.socketModeConnected,
+      lastConnectedAt: this.socketModeLastConnectedAt ? new Date(this.socketModeLastConnectedAt).toISOString() : "",
+      lastDisconnectedAt: this.socketModeLastDisconnectedAt
+        ? new Date(this.socketModeLastDisconnectedAt).toISOString()
+        : "",
+      reconnectCount: this.socketModeReconnectCount,
+      duplicateEventsDropped: this.duplicateSocketEventCount,
+      processedHumanEvents: this.processedHumanEventCount,
+      lastSocketError: this.lastSocketError,
+      lastSocketErrorAt: this.lastSocketErrorAt ? new Date(this.lastSocketErrorAt).toISOString() : ""
+    };
+  }
 
   async ensureInitialized(): Promise<boolean> {
     const config = await this.configStore.load();
@@ -317,6 +358,7 @@ export class ChatSlackBridge {
     }
     this.slackAdapter = null;
     this.socketModeEnabled = false;
+    this.socketModeConnected = false;
     this.initializedFingerprint = "";
   }
 
@@ -385,11 +427,11 @@ export class ChatSlackBridge {
 
     const clientPingTimeout = parsePositiveNumber(
       process.env.ISSUE_HUNTER_SLACK_CLIENT_PING_TIMEOUT_MS,
-      20_000
+      60_000
     );
     const serverPingTimeout = parsePositiveNumber(
       process.env.ISSUE_HUNTER_SLACK_SERVER_PING_TIMEOUT_MS,
-      120_000
+      180_000
     );
     const client = new SocketModeClient({
       appToken,
@@ -401,11 +443,18 @@ export class ChatSlackBridge {
       `[issue-hunter] Slack Socket Mode options clientPingTimeout=${clientPingTimeout}ms serverPingTimeout=${serverPingTimeout}ms`
     );
     client.on("connected", () => {
+      const wasConnected = this.socketModeConnected;
       this.socketModeLastConnectedAt = Date.now();
+      this.socketModeConnected = true;
+      if (wasConnected || this.socketModeLastDisconnectedAt > 0) {
+        this.socketModeReconnectCount += 1;
+        void Promise.resolve(this.onSocketModeReconnected?.()).catch(() => undefined);
+      }
       void this.logSlackInfo("[issue-hunter] Slack Socket Mode connected");
     });
     client.on("disconnected", (error: unknown) => {
       this.socketModeLastDisconnectedAt = Date.now();
+      this.socketModeConnected = false;
       void this.logSlackWarn(
         `[issue-hunter] Slack Socket Mode disconnected ${
           error instanceof Error ? error.message : String(error)
@@ -413,6 +462,8 @@ export class ChatSlackBridge {
       );
     });
     client.on("error", (error: unknown) => {
+      this.lastSocketError = error instanceof Error ? error.message : String(error);
+      this.lastSocketErrorAt = Date.now();
       void this.logSlackError(
         `[issue-hunter] Slack Socket Mode error ${
           error instanceof Error ? error.message : String(error)
@@ -445,8 +496,16 @@ export class ChatSlackBridge {
         void this.logSlackInfo("[issue-hunter][slack] events_api envelope received but body.event is empty");
         return;
       }
-
       this.logInboundEvent("received", event);
+
+      const dedupKey = buildSocketEventDedupKey({
+        envelopeId: String(body.event_id ?? args.envelope_id ?? "").trim(),
+        event
+      });
+      if (this.isDuplicateSocketModeEvent(dedupKey)) {
+        return;
+      }
+
       await this.handleSocketModeEvent(event);
     });
 
@@ -469,6 +528,13 @@ export class ChatSlackBridge {
         return;
       }
       this.logInboundEvent("received_legacy_events_api", event);
+      const legacyDedupKey = buildSocketEventDedupKey({
+        envelopeId: String((args.body as Record<string, unknown> | undefined)?.event_id ?? args.envelope_id ?? "").trim(),
+        event
+      });
+      if (this.isDuplicateSocketModeEvent(legacyDedupKey)) {
+        return;
+      }
       await this.handleSocketModeEvent(event);
     });
 
@@ -479,6 +545,7 @@ export class ChatSlackBridge {
   private async stopSocketModeClient(): Promise<void> {
     const client = this.socketModeClient;
     this.socketModeClient = null;
+    this.socketModeConnected = false;
     if (!client) {
       return;
     }
@@ -539,12 +606,12 @@ export class ChatSlackBridge {
     }
 
     if (this.isSelfSlackEvent(event)) {
-      void this.logInboundEvent("ignored_self", event);
+      this.recordIgnoredEvent("self");
       return;
     }
 
     if (!isHumanSocketModeEvent(event)) {
-      void this.logInboundEvent("ignored_non_human", event);
+      this.recordIgnoredEvent("non_human");
       return;
     }
 
@@ -553,6 +620,7 @@ export class ChatSlackBridge {
       this.logInboundEvent("ignored_unparseable", event);
       return;
     }
+    this.processedHumanEventCount += 1;
 
     void this.logSlackInfo(
       `[issue-hunter][slack] inbound parsed thread=${inbound.threadId} channel=${inbound.channelId} mention=${inbound.isMention} text="${previewText(inbound.text)}"`
@@ -742,6 +810,75 @@ export class ChatSlackBridge {
     } catch {
       // Ignore disk logging failures; console logging remains primary.
     }
+  }
+
+  private recordIgnoredEvent(type: "self" | "non_human"): void {
+    const now = Date.now();
+    const intervalMs = Math.max(10_000, Number(process.env.ISSUE_HUNTER_SLACK_IGNORED_EVENT_LOG_INTERVAL_MS || 60_000));
+
+    if (type === "self") {
+      this.ignoredSelfEventCount += 1;
+      if (now - this.lastIgnoredSelfLogAt >= intervalMs) {
+        const count = this.ignoredSelfEventCount;
+        this.ignoredSelfEventCount = 0;
+        this.lastIgnoredSelfLogAt = now;
+        void this.logSlackInfo(`[issue-hunter][slack] ignored self events in window: ${count}`);
+      }
+      return;
+    }
+
+    this.ignoredNonHumanEventCount += 1;
+    if (now - this.lastIgnoredNonHumanLogAt >= intervalMs) {
+      const count = this.ignoredNonHumanEventCount;
+      this.ignoredNonHumanEventCount = 0;
+      this.lastIgnoredNonHumanLogAt = now;
+      void this.logSlackInfo(`[issue-hunter][slack] ignored non-human events in window: ${count}`);
+    }
+  }
+
+  private isDuplicateSocketModeEvent(keyRaw: string): boolean {
+    const key = String(keyRaw || "").trim();
+    if (!key) {
+      return false;
+    }
+
+    const now = Date.now();
+    const ttlMs = Math.max(30_000, Number(process.env.ISSUE_HUNTER_SLACK_EVENT_DEDUP_TTL_MS || 10 * 60 * 1000));
+    const maxEntries = Math.max(1000, Number(process.env.ISSUE_HUNTER_SLACK_EVENT_DEDUP_MAX_ENTRIES || 20_000));
+    const duplicateLogIntervalMs = Math.max(
+      10_000,
+      Number(process.env.ISSUE_HUNTER_SLACK_DEDUP_LOG_INTERVAL_MS || 60_000)
+    );
+
+    const cutoff = now - ttlMs;
+    if (this.socketEventDedup.size >= maxEntries) {
+      for (const [candidate, ts] of this.socketEventDedup) {
+        if (ts < cutoff || this.socketEventDedup.size >= maxEntries) {
+          this.socketEventDedup.delete(candidate);
+        }
+      }
+    } else {
+      for (const [candidate, ts] of this.socketEventDedup) {
+        if (ts < cutoff) {
+          this.socketEventDedup.delete(candidate);
+        }
+      }
+    }
+
+    const previous = this.socketEventDedup.get(key);
+    this.socketEventDedup.set(key, now);
+    if (previous === undefined || now - previous > ttlMs) {
+      return false;
+    }
+
+    this.duplicateSocketEventCount += 1;
+    if (now - this.lastDuplicateSocketEventLogAt >= duplicateLogIntervalMs) {
+      const count = this.duplicateSocketEventCount;
+      this.duplicateSocketEventCount = 0;
+      this.lastDuplicateSocketEventLogAt = now;
+      void this.logSlackInfo(`[issue-hunter][slack] duplicate socket events dropped in window: ${count}`);
+    }
+    return true;
   }
 }
 
@@ -944,6 +1081,39 @@ export function isHumanSocketModeEvent(event: Record<string, unknown>): boolean 
   const topClientMsgId = String(event.client_msg_id || "").trim();
   const nestedClientMsgId = String(nestedMessage.client_msg_id || "").trim();
   return Boolean(topClientMsgId || nestedClientMsgId);
+}
+
+export function buildSocketEventDedupKey(input: {
+  envelopeId?: string;
+  event: Record<string, unknown>;
+}): string {
+  const envelopeId = String(input.envelopeId || "").trim();
+  if (envelopeId) {
+    return `envelope:${envelopeId}`;
+  }
+
+  const event = input.event ?? {};
+  const nestedMessage = (event.message ?? {}) as Record<string, unknown>;
+  const type = String(event.type || "").trim();
+  const subtype = String(event.subtype || "").trim();
+  const channel = String(event.channel || nestedMessage.channel || "").trim();
+  const user = resolveEventUserId(event);
+  const threadTs = String(event.thread_ts || nestedMessage.thread_ts || "").trim();
+  const ts = String(event.event_ts || event.ts || nestedMessage.ts || "").trim();
+  const clientMsgId = String(event.client_msg_id || nestedMessage.client_msg_id || "").trim();
+  const text = previewText(String(event.text || nestedMessage.text || "").trim(), 80);
+
+  return [
+    "event",
+    type || "-",
+    subtype || "-",
+    channel || "-",
+    user || "-",
+    threadTs || "-",
+    ts || "-",
+    clientMsgId || "-",
+    text || "-"
+  ].join("|");
 }
 
 function resolveCredential(directValue: string, envName: string): string {

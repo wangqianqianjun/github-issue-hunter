@@ -36,6 +36,7 @@ async function main() {
     stopService: async () => service.stop(),
     runOnce: async () => service.runOnce(),
     getServiceStatus: async () => service.getStatus(),
+    getServiceHealth: async () => service.getHealthStatus(),
     listBoardCards: async () => service.listBoardCards(),
     getBoardDetail: async (repoId, issueNumber) => service.getBoardDetail(repoId, issueNumber),
     slackWebhookHandler: async (req, res) => service.handleSlackWebhook(req, res),

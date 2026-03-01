@@ -53,6 +53,7 @@ export interface ServiceState {
   lastRunAt: string;
   lastError: string;
   activeTasks: number;
+  lastHealthAt?: string;
 }
 
 export interface AppConfig {
@@ -89,6 +90,9 @@ export interface IssueExecutionRecord {
   codexSessionId?: string;
   triageSessionId?: string;
   implementSessionId?: string;
-  lastTriggerType?: "new" | "retry_failed" | "new_comment" | "slack_signal" | "approval" | "manual";
+  lastTriggerType?: "new" | "retry_failed" | "new_comment" | "slack_signal" | "approval" | "manual" | "stale_recovery";
+  failureCategory?: "transient" | "logic" | "config" | "cancelled" | "unknown";
+  failureRetryEligible?: boolean;
+  lastWorkerHeartbeatAt?: string;
   updatedAt: string;
 }

@@ -49,6 +49,7 @@ interface ApiAppDeps {
   stopService: () => Promise<void>;
   runOnce: () => Promise<void>;
   getServiceStatus: () => Promise<ServiceStatus>;
+  getServiceHealth?: () => Promise<unknown>;
   listBoardCards?: () => Promise<BoardCardResponse[]>;
   getBoardDetail?: (repoId: string, issueNumber: number) => Promise<unknown | null>;
   slackWebhookHandler?: (request: Request, response: Response) => Promise<void>;
@@ -96,6 +97,23 @@ export async function createApiApp(deps: ApiAppDeps) {
   app.get("/api/config", async (_req, res) => {
     const config = await deps.configStore.load();
     res.json(config);
+  });
+
+  app.get("/api/health", async (_req, res) => {
+    if (deps.getServiceHealth) {
+      const health = await deps.getServiceHealth();
+      res.json(health);
+      return;
+    }
+    const status = await deps.getServiceStatus();
+    res.json({
+      now: new Date().toISOString(),
+      service: {
+        ...status,
+        runOnceInFlight: false,
+        schedulerTickLagMs: 0
+      }
+    });
   });
 
   app.get("/api/board", async (_req, res) => {

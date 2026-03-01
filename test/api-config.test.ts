@@ -23,6 +23,18 @@ describe("API config endpoints", () => {
       startService: async () => undefined,
       stopService: async () => undefined,
       runOnce: async () => undefined,
+      getServiceHealth: async () => ({
+        now: "2026-03-01T00:00:00.000Z",
+        service: {
+          running: false,
+          activeTasks: 0,
+          queueLength: 0,
+          lastRunAt: "",
+          lastError: "",
+          runOnceInFlight: false,
+          schedulerTickLagMs: 0
+        }
+      }),
       listBoardCards: async () => [
         {
           issueKey: "acme/web#7",
@@ -98,6 +110,10 @@ describe("API config endpoints", () => {
     const initial = await request(app).get("/api/config");
     expect(initial.status).toBe(200);
     expect(initial.body.repositories).toHaveLength(0);
+
+    const health = await request(app).get("/api/health");
+    expect(health.status).toBe(200);
+    expect(health.body.service.runOnceInFlight).toBe(false);
 
     const board = await request(app).get("/api/board");
     expect(board.status).toBe(200);
