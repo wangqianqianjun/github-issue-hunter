@@ -3,7 +3,7 @@
 一个面向本地仓库的 GitHub Issue 自动处理系统：
 - 24x7 轮询仓库 Open Issue
 - 自动 triage（是否需要处理）
-- 需要处理时在隔离 `worktree` 中调用 Codex 执行修复
+- 需要处理时在隔离 `worktree` 中调用可配置 AI CLI（Codex / Claude）执行修复
 - 自动回写 issue（Summary / RootCause / Solution / PR）
 - 可选 Slack 集成（线程内持续跟进）
 - 内置 Web UI（Issue Hunter / Board / Slack）
@@ -19,9 +19,13 @@
   - 只有收到 approve 后，才进入实际实现阶段
 - 会话编排调整（电话机模式）
   - 只有 GitHub 新 issue 首次进入会走 triage
-  - 同一 issue 下后续 comment 不再 triage，直接转发给同一 Codex session 继续处理
-  - Slack 消息默认直接转发 Codex，不追加额外 prompt
+  - 同一 issue 下后续 comment 不再 triage，直接进入实现阶段
+  - Slack 消息优先走 Channel 直连链路；无法路由时才回落到 issue signal 链路
   - Board 中会展示“处理中（含 awaiting_approval）”与“已完成”
+- AI Backend 自动探测与切换
+  - 自动探测本机 `codex` 与 `claude` 可执行文件
+  - 仅一个可用则默认该后端；两个都可用默认 `codex`
+  - 可在 UI 全局配置中手动切换后端
 - Slack 消息批量合并
   - 线程进度更新会按时间窗口聚合，减少刷屏
   - 默认每 45 秒发送一批（可通过环境变量调整）
@@ -34,6 +38,7 @@
   - Slack Socket 事件增加去重缓存，避免重复事件导致重复触发
   - `gh api` 调用增加指数退避重试，缓解短暂网络抖动（如 `connection reset by peer`）
   - Slack 频道 thread 会话绑定 `issueKey`，拒绝跨 issue 复用，避免上下文串线
+  - 若 thread 绑定的 worktree 已丢失，会自动重建后继续执行
 
 ## 界面预览
 
@@ -71,101 +76,79 @@
   - 支持 Socket Mode
   - 线程消息批量聚合，默认降低高频推送
 
-## 当前处理 Workflow（含硬编码匹配点）
+## 当前处理 Workflow（与代码实现对齐）
 
 ```mermaid
 flowchart TD
-  subgraph GitHub轮询入口
-    A[IssueHunterService.runOnce] --> B[IssueEngine.collectPendingTasks]
-    B --> C{触发条件}
-    C -->|new/retry_failed/stale_recovery/slack_signal/new_comment| D[dispatch worker]
-  end
-
-  subgraph Slack入口
-    S1[SocketMode event] --> S2{self/non-human过滤}
-    S2 -->|是| SX[忽略]
-    S2 -->|否| S3{stop/status命令?}
-    S3 -->|是| SY[直接回复控制信息]
-    S3 -->|否| S4{channel消息可接收?}
-    S4 -->|是| S5[SlackChannelCodexManager 直连Codex]
-    S4 -->|否| S6{issue线程信号可接收?}
-    S6 -->|是| S7[registerSlackSignal]
-    S7 --> A
-    S6 -->|否| SZ[无上下文提示]
-  end
-
-  D --> E[IssueWorker.runSpecificIssue]
-  E --> F[processIssue: 拉issue+comments+图片]
-  F --> G{trigger == new?}
-  G -->|是| I[runTriage -> AI]
-  G -->|否| L[直接 implement]
-  I --> J[解析needs_processing/next_step]
-  J --> K{next_step}
-  K -->|ignore| K1[回复ignore并结束]
-  K -->|confirm| K2[回写待确认并保持awaiting_approval]
-  K -->|plan且planMode=true| K3[runImplementation仅出方案 -> 回写方案 -> awaiting_approval]
-  K -->|implement| L[回复implement wording]
-  L --> M[runImplementation -> AI修复]
-  M --> N[ensure PR URL]
-  N --> O[回写Summary/RootCause/Solution/PR]
-  O --> P[completed]
+  A["IssueHunterService.runOnce"] --> B["IssueEngine.collectPendingTasks"]
+  B --> C{"trigger type"}
+  C -->|"new"| D["dispatch worker"]
+  C -->|"retry_failed / stale_recovery / slack_signal / new_comment"| D
+  D --> E["issue-worker -> IssueEngine.processIssue"]
+  E --> F{"trigger == new ?"}
+  F -->|"yes"| G["runTriage"]
+  F -->|"no"| L["skip triage"]
+  G --> H{"needs_processing + next_step"}
+  H -->|"ignore"| I["comment ignore wording + state=ignored"]
+  H -->|"confirm"| J["comment confirm + state=awaiting_approval"]
+  H -->|"plan and planMode=true"| K["runImplementation(plan only) + comment plan + state=awaiting_approval"]
+  H -->|"implement"| L
+  L --> M["runImplementation"]
+  M --> N["ensure PR URL"]
+  N --> O["comment summary/rootcause/solution/pr"]
+  O --> P{"closeIssueOnDone ?"}
+  P -->|"yes"| Q["close issue"]
+  P -->|"no"| R["keep open"]
+  Q --> S["state=completed"]
+  R --> S
 ```
 
-### Codex 调用与 Session 复用编排图
+### Slack 路由与 Session 复用编排图
 
 ```mermaid
 flowchart TD
-  subgraph GitHub链路[GitHub Issue 自动处理链路]
-    G1[runOnce -> collectPendingTasks] --> G2[dispatchWorker 拉起 issue-worker]
-    G2 --> G3[IssueEngine.processIssue]
-    G3 --> G4[从 runtime/issues.json 读取 existing session]
-    G4 --> G5[runTriage / runImplementation]
-    G5 --> G6[CodexRunner 注入 resume session]
-    G6 --> G7[codex exec]
-    G7 --> G8[thread.started 返回新的 thread_id]
-    G8 --> G9[回写 codexSessionId 到 runtime/issues.json]
-    G9 --> G10[同一 issue 后续 comment/slack_signal 继续复用]
-  end
-
-  subgraph Slack链路[Slack 频道直连链路]
-    S1[Socket Mode 收到人类消息] --> S2[extractSocketModeInboundMessage]
-    S2 --> S3{isThreadReply?}
-    S3 -->|否: 频道主流新消息| S4[只给 repo/issue hint]
-    S4 --> S5[不传 session/worktree hint]
-    S5 --> S6[SlackChannelCodexManager 新建 thread session]
-    S3 -->|是: thread 回复| S7[resolveIssueKeyByThreadToken]
-    S7 --> S8[从 runtime/issues.json 读取 session/worktree hint]
-    S8 --> S9[SlackChannelCodexManager 复用 thread session]
-    S6 --> S10[codex exec (无resume)]
-    S9 --> S11[codex exec resume session-id]
-    S10 --> S12[thread.started -> 更新 sessionId]
-    S11 --> S12
-    S12 --> S13[持久化到 runtime/slack-channel-sessions.json]
-    S13 --> S14[同一 Slack thread 后续消息继续复用]
-  end
-
-  G9 -. issue线程消息映射 .-> S8
+  S1["Socket Mode inbound event"] --> S2{"human message ?"}
+  S2 -->|"no"| SX["ignore"]
+  S2 -->|"yes"| S3["post ack emoji"]
+  S3 --> S4{"stop/status command ?"}
+  S4 -->|"yes"| SY["run control command and reply"]
+  S4 -->|"no"| S5["channelMessageProvider (priority 1)"]
+  S5 --> S6{"accepted ?"}
+  S6 -->|"yes"| C1["SlackChannelCodexManager"]
+  C1 --> C2{"thread reply ?"}
+  C2 -->|"yes"| C3["load runtime hints: repo/session/worktree"]
+  C2 -->|"no"| C4["new channel task: no session/worktree reuse"]
+  C3 --> C5["ensure worktree exists; recreate if missing"]
+  C4 --> C5
+  C5 --> C6["spawn agent exec (with optional resume)"]
+  C6 --> C7["thread.started -> persist session id"]
+  C7 --> C8["save thread session to runtime/slack-channel-sessions.json"]
+  S6 -->|"no"| S7["signalProvider fallback"]
+  S7 --> S8{"issue thread can be mapped ?"}
+  S8 -->|"yes"| S9["registerSlackSignal + save lastSlackSignalText"]
+  S9 --> S10["trigger runOnce -> schedule slack_signal"]
+  S8 -->|"no"| SZ["reply no context matched"]
 ```
 
 ### 哪些 comment 会交给 AI agent 处理
 
-1. GitHub issue 正文与评论会进入 `context.json`，用于 triage/implement。  
-   代码：`src/core/issue-engine.ts`（`prepareWorkspace` 前后）
-2. `new`（GitHub 新 issue 首次）触发时，会先进入 AI triage。  
-   代码：`src/core/issue-engine.ts`（`shouldRunTriage` + `runTriage` 分支）
-3. `new_comment / slack_signal / retry_failed / stale_recovery` 不再进入 triage，直接转发给 implement 阶段并复用会话。  
+1. GitHub 新 issue 首次触发（`triggerType = new`）会先 triage，再按结果进入 ignore/confirm/plan/implement。  
+   代码：`src/core/issue-engine.ts`（`shouldRunTriage = input.triggerType === "new"`）
+2. GitHub 后续评论不会默认全量触发；仅在记录状态为 `completed/ignored/failed/awaiting_approval` 且出现“新的外部评论 ID”时，触发 `new_comment`。  
+   代码：`src/core/issue-engine.ts`（`collectPendingTasks` 内 `retryNewComment` 分支）
+3. `new_comment / slack_signal / retry_failed / stale_recovery` 都跳过 triage，直接进入实现阶段。  
    代码：`src/core/issue-engine.ts`（`shouldRunTriage === false` 分支）
-4. Slack issue-thread 消息先写入 `lastSlackSignalText`，再由 issue 主流程调度 AI implement。  
-   代码：`src/core/issue-hunter-service.ts`（`registerSlackSignal`）
-5. Slack channel/thread 消息走 `SlackChannelCodexManager`，直接拉起/续接 codex 会话。  
-   代码：`src/core/slack-channel-codex-manager.ts`
+4. Slack 消息先走 `channelMessageProvider`；被接收时直接进入 `SlackChannelCodexManager`（频道主流新消息新建会话，thread 回复复用会话）。  
+   代码：`src/chat/vercel-chat-bridge.ts`（`channelMessageProvider` 优先于 `signalProvider`）
+5. 只有当 `channelMessageProvider` 未接收时，才回落到 `signalProvider(registerSlackSignal)`，并在下一轮 `runOnce` 以 `slack_signal` 触发 issue 流程。  
+   代码：`src/core/issue-hunter-service.ts`（`registerSlackSignal` + `runOnceSafe`）
 
 ### Hardcode 正则/字符串匹配（当前实现）
 
 | 模块 | 用途 | 规则（正则/字符串） |
 |---|---|---|
 | `src/chat/vercel-chat-bridge.ts` | stop 命令 | `/(^|\s)(stop\|cancel\|abort\|terminate)(\s\|$)/i` + `"停止"`, `"中止"`, `"终止"` |
-| `src/chat/vercel-chat-bridge.ts` | status 命令 | `text.includes("status")` |
+| `src/chat/vercel-chat-bridge.ts` | status 命令 | `/^\/?(status\|状态\|服务状态\|运行状态)([?!？！。]?)$/`（会先去掉 `<@...>` mention） |
 | `src/chat/vercel-chat-bridge.ts` | Slack事件类型 | `type === "message"` 或 `type === "app_mention"`；`subtype` 白名单/黑名单（如 `message_replied`, `thread_broadcast`, `bot_message`） |
 | `src/chat/vercel-chat-bridge.ts` | 人类消息过滤 | 必须有 `client_msg_id`，且过滤 bot/user=self |
 | `src/core/issue-engine.ts` | 新评论触发重处理 | `latestExternalCommentId > lastExternalCommentId` |
@@ -263,6 +246,10 @@ npm run service:stop
 仓库已通过 `.gitignore` 默认排除敏感与运行态文件（如 Slack/GitHub 凭据、runtime 日志、临时产物），避免误提交。
 
 如果你新增了凭据文件，请同步更新 `.gitignore`。
+
+## License
+
+本项目基于 [MIT License](./LICENSE) 开源。
 
 ## 常用命令
 

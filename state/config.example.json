@@ -5,6 +5,8 @@
       "owner": "acme",
       "repo": "web",
       "localPath": "/Users/you/code/acme-web",
+      "mediaRepo": "acme/web",
+      "mediaBranch": "github-issue-hunter-media",
       "triageCommand": "codex exec --json --prompt-file {context_file}",
       "implementCommand": "codex exec --json --prompt-file {context_file}",
       "enabled": true,
@@ -20,6 +22,7 @@
     "pollIntervalSeconds": 30,
     "globalConcurrency": 2,
     "workspaceDir": ".",
+    "agentBackend": "codex",
     "closeIssueOnDone": true,
     "keepWorktrees": false
   },
