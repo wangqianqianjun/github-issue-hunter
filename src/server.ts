@@ -48,6 +48,17 @@ async function main() {
     }
   });
 
+  try {
+    const resumed = await service.resumeFromServiceState();
+    if (resumed) {
+      // eslint-disable-next-line no-console
+      console.log("[issue-hunter] Auto-resumed 24x7 service from persisted state.");
+    }
+  } catch (error) {
+    // eslint-disable-next-line no-console
+    console.warn(`[issue-hunter] Failed to auto-resume service: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
   app.listen(port, host, () => {
     // eslint-disable-next-line no-console
     console.log(`Issue Hunter UI running at http://${host}:${port}`);

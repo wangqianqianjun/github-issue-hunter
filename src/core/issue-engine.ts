@@ -11,6 +11,7 @@ export interface RuntimeStore {
   markSeen(issueKey: string): Promise<void>;
   saveRecord(record: IssueExecutionRecord): Promise<void>;
   listCompleted(): Promise<IssueExecutionRecord[]>;
+  listAll?(): Promise<IssueExecutionRecord[]>;
 }
 
 export interface GitHubClientLike {
@@ -85,7 +86,8 @@ interface IssueEngineDependencies {
     repo: RepositoryConfig,
     issue: Record<string, unknown>,
     comments: Record<string, unknown>[],
-    imageUrls: string[]
+    imageUrls: string[],
+    existingRecord?: IssueExecutionRecord | null
   ) => Promise<WorkspacePreparation>;
   onThreadRegistered?: (issueKey: string, threadToken: string, repo: RepositoryConfig) => Promise<void> | void;
   onThreadUnregistered?: (issueKey: string) => Promise<void> | void;
@@ -275,6 +277,9 @@ export class IssueEngine {
         );
         continue;
       }
+
+      await this.cleanupClosedIssueWorktrees(repo, github, issues);
+
       for (const issueSummary of issues) {
         if ((issueSummary as { pull_request?: unknown }).pull_request) {
           continue;
@@ -316,6 +321,16 @@ export class IssueEngine {
           const latestExternal = findLatestExternalComment(latestComments);
           const baseline = Number(existingRecord.lastExternalCommentId || 0);
           retryNewComment = latestExternal.id > baseline;
+          if (retryNewComment) {
+            const latestExternalMeta = findIssueCommentById(latestComments, latestExternal.id);
+            // eslint-disable-next-line no-console
+            console.warn(
+              `[issue-hunter][trigger] issue=${issueKey} trigger=new_comment source_state=${existingRecord.state} ` +
+                `baseline=${baseline} latest_id=${latestExternal.id} latest_at=${latestExternal.createdAt || "-"} ` +
+                `latest_author=${latestExternalMeta.author} latest_assoc=${latestExternalMeta.authorAssociation} ` +
+                `latest_managed=${latestExternalMeta.managed} latest_preview="${latestExternalMeta.preview}"`
+            );
+          }
         }
 
         if (
@@ -329,6 +344,16 @@ export class IssueEngine {
           const baseline = Number(existingRecord.lastExternalCommentId || 0);
           const latestExternal = findLatestExternalComment(latestComments);
           retryNewComment = latestExternal.id > baseline;
+          if (retryNewComment) {
+            const latestExternalMeta = findIssueCommentById(latestComments, latestExternal.id);
+            // eslint-disable-next-line no-console
+            console.warn(
+              `[issue-hunter][trigger] issue=${issueKey} trigger=new_comment source_state=${existingRecord.state} ` +
+                `baseline=${baseline} latest_id=${latestExternal.id} latest_at=${latestExternal.createdAt || "-"} ` +
+                `latest_author=${latestExternalMeta.author} latest_assoc=${latestExternalMeta.authorAssociation} ` +
+                `latest_managed=${latestExternalMeta.managed} latest_preview="${latestExternalMeta.preview}"`
+            );
+          }
         }
 
         const shouldSchedule =
@@ -378,10 +403,111 @@ export class IssueEngine {
                 ? "slack_signal"
                 : "new_comment"
         });
+        // eslint-disable-next-line no-console
+        console.info(
+          `[issue-hunter][schedule] issue=${issueKey} trigger=${tasks[tasks.length - 1].triggerType} ` +
+            `seen=${seen} seen_without_record=${seenWithoutRecord} retry_failed=${retryFailed} ` +
+            `retry_stale=${retryStaleInFlight} retry_slack=${retrySlackSignal} retry_new_comment=${retryNewComment}`
+        );
       }
     }
 
     return tasks;
+  }
+
+  private async cleanupClosedIssueWorktrees(
+    repo: RepositoryConfig,
+    github: GitHubClientLike,
+    openIssues: Record<string, unknown>[]
+  ): Promise<void> {
+    const listAll = this.deps.runtimeStore.listAll;
+    if (!listAll) {
+      return;
+    }
+
+    const openIssueNumbers = new Set<number>();
+    for (const issue of openIssues) {
+      const issueNumber = Number(issue.number);
+      if (Number.isFinite(issueNumber)) {
+        openIssueNumbers.add(issueNumber);
+      }
+    }
+
+    let records: IssueExecutionRecord[] = [];
+    try {
+      records = await listAll.call(this.deps.runtimeStore);
+    } catch {
+      return;
+    }
+
+    const candidates = records.filter((record) => {
+      if (record.repoId !== repo.id) {
+        return false;
+      }
+      const worktreePath = String(record.issueWorktreePath || "").trim();
+      if (!worktreePath) {
+        return false;
+      }
+      return !openIssueNumbers.has(Number(record.issueNumber));
+    });
+
+    for (const record of candidates) {
+      let issueState = "";
+      try {
+        const issue = await github.getIssue(record.issueNumber);
+        issueState = String(issue.state || "").trim().toLowerCase();
+      } catch {
+        continue;
+      }
+      if (issueState !== "closed") {
+        continue;
+      }
+
+      const issueKey = `${repo.owner}/${repo.repo}#${record.issueNumber}`;
+      if (!this.coordinator.tryAcquire(issueKey)) {
+        continue;
+      }
+      try {
+        const worktreePath = String(record.issueWorktreePath || "").trim();
+        const worktreeBranch = String(record.issueWorktreeBranch || "").trim();
+        await this.cleanupIssueWorktree(repo.localPath, worktreePath, worktreeBranch);
+
+        await this.deps.runtimeStore.saveRecord({
+          ...record,
+          issueWorktreePath: "",
+          issueWorktreeBranch: "",
+          closedAt: String(record.closedAt || "").trim() || nowIso(),
+          updatedAt: nowIso()
+        });
+      } finally {
+        this.coordinator.release(issueKey);
+      }
+    }
+  }
+
+  private async cleanupIssueWorktree(repoLocalPath: string, worktreePath: string, worktreeBranch: string): Promise<void> {
+    const normalizedPath = String(worktreePath || "").trim();
+    const normalizedBranch = String(worktreeBranch || "").trim();
+
+    if (normalizedPath) {
+      const removeResult = await this.exec(
+        "git",
+        ["-C", repoLocalPath, "worktree", "remove", "--force", normalizedPath],
+        repoLocalPath
+      );
+      if (removeResult.code !== 0 && !isIgnorableWorktreeRemoveError(`${removeResult.stdout}\n${removeResult.stderr}`)) {
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[issue-hunter] failed to auto-clean worktree ${normalizedPath}: ${removeResult.stderr || removeResult.stdout}`
+        );
+      }
+    }
+
+    if (normalizedBranch) {
+      await this.exec("git", ["-C", repoLocalPath, "branch", "-D", normalizedBranch], repoLocalPath);
+    }
+
+    await this.exec("git", ["-C", repoLocalPath, "worktree", "prune"], repoLocalPath);
   }
 
   private async processIssue(input: IssueTaskInput): Promise<void> {
@@ -393,7 +519,7 @@ export class IssueEngine {
 
     const issueComments = await input.github.listIssueComments(input.issueNumber);
     const latestExternalComment = findLatestExternalComment(issueComments);
-    const latestExternalCommentBody = findLatestExternalCommentBody(issueComments);
+    const latestExternalCommentMeta = findIssueCommentById(issueComments, latestExternalComment.id);
     const inheritedSlackSignalAt = String(input.existingRecord?.lastSlackSignalAt ?? "").trim();
     const inheritedSlackSignalText = String(input.existingRecord?.lastSlackSignalText ?? "").trim();
     const inheritedHandledSlackSignalAt = String(input.existingRecord?.lastHandledSlackSignalAt ?? "").trim();
@@ -403,6 +529,8 @@ export class IssueEngine {
       input.existingRecord?.triageSessionId ??
       ""
     ).trim();
+    let currentIssueWorktreePath = String(input.existingRecord?.issueWorktreePath ?? "").trim();
+    let currentIssueWorktreeBranch = String(input.existingRecord?.issueWorktreeBranch ?? "").trim();
     const handledSlackSignalAt =
       input.triggerType === "slack_signal" ? inheritedSlackSignalAt : inheritedHandledSlackSignalAt;
     const cycleId = buildIssueCycleId({
@@ -414,24 +542,23 @@ export class IssueEngine {
     });
 
     const contextComments = withSyntheticSignalComments(issueComments, input.triggerType, inheritedSlackSignalText);
-    const explicitApprovalSignal =
-      input.triggerType === "new_comment" &&
-      input.existingRecord?.state === "awaiting_approval" &&
-      isExplicitApprovalComment(latestExternalCommentBody);
-    let implementUserMessage = buildImplementUserMessage(
+    const shouldRunTriage = input.triggerType === "new";
+    // eslint-disable-next-line no-console
+    console.info(
+      `[issue-hunter][process] start issue=${input.issueKey} trigger=${input.triggerType} ` +
+        `existing_state=${input.existingRecord?.state || "-"} existing_session=${currentCodexSessionId || "-"} ` +
+        `existing_thread=${threadTs || "-"} existing_worktree=${currentIssueWorktreePath || "-"} ` +
+        `latest_external_id=${latestExternalComment.id} latest_external_at=${latestExternalComment.createdAt || "-"} ` +
+        `latest_external_author=${latestExternalCommentMeta.author} latest_external_assoc=${latestExternalCommentMeta.authorAssociation} ` +
+        `latest_external_managed=${latestExternalCommentMeta.managed} ` +
+        `latest_external_preview="${latestExternalCommentMeta.preview}"`
+    );
+    const implementUserMessage = buildImplementUserMessage(
       issue,
       issueComments,
       input.triggerType,
-      inheritedSlackSignalText,
-      input.existingRecord
+      inheritedSlackSignalText
     );
-    if (explicitApprovalSignal) {
-      implementUserMessage = buildImplementUserMessageFromApproval(
-        issue,
-        latestExternalCommentBody,
-        input.existingRecord
-      );
-    }
 
     const baseRecord = (state: IssueExecutionRecord["state"], patch: Partial<IssueExecutionRecord>): IssueExecutionRecord => ({
       issueKey: input.issueKey,
@@ -452,6 +579,8 @@ export class IssueEngine {
       codexSessionId: patch.codexSessionId ?? currentCodexSessionId,
       triageSessionId: patch.triageSessionId ?? currentCodexSessionId,
       implementSessionId: patch.implementSessionId ?? currentCodexSessionId,
+      issueWorktreePath: patch.issueWorktreePath ?? currentIssueWorktreePath,
+      issueWorktreeBranch: patch.issueWorktreeBranch ?? currentIssueWorktreeBranch,
       lastTriggerType: patch.lastTriggerType ?? input.triggerType,
       failureCategory: patch.failureCategory ?? undefined,
       failureRetryEligible: patch.failureRetryEligible ?? undefined,
@@ -466,10 +595,7 @@ export class IssueEngine {
     const threadBatcher = createThreadUpdateBatcher(input.notifier, threadTs, threadBatchIntervalMs);
 
     try {
-      const shouldPostTriageWording =
-        input.triggerType === "new" ||
-        input.triggerType === "retry_failed" ||
-        input.triggerType === "stale_recovery";
+      const shouldPostTriageWording = shouldRunTriage;
       if (shouldPostTriageWording) {
         await this.createIssueCommentIfNeeded(
           input.github,
@@ -479,7 +605,7 @@ export class IssueEngine {
           `${cycleId}:triage`
         );
       }
-      await this.deps.runtimeStore.saveRecord(baseRecord("triaging", {}));
+      await this.deps.runtimeStore.saveRecord(baseRecord(shouldRunTriage ? "triaging" : "scheduled", {}));
 
       const imageUrls = extractImageUrls(issue, issueComments);
       const workspace = await this.prepareWorkspace(
@@ -487,8 +613,11 @@ export class IssueEngine {
         issue,
         contextComments,
         imageUrls,
-        input.github
+        input.github,
+        input.existingRecord
       );
+      currentIssueWorktreePath = String(workspace.worktreePath || "").trim() || currentIssueWorktreePath;
+      currentIssueWorktreeBranch = String(workspace.worktreeBranch || "").trim() || currentIssueWorktreeBranch;
 
       try {
         const progressIntervalMs = Math.max(5, Number(process.env.CODEX_PROGRESS_UPDATE_INTERVAL_SECONDS || 20)) * 1000;
@@ -500,31 +629,24 @@ export class IssueEngine {
           threadBatcher.setThread(threadTs);
           this.registerThreadToken(input.issueKey, threadTs);
           await this.deps.onThreadRegistered?.(input.issueKey, threadTs, input.repo);
-          const startMessage =
-            input.triggerType === "new"
-              ? "Issue 已进入评估阶段，AI 将判断下一阶段。"
-              : input.triggerType === "retry_failed"
-                ? "检测到上次执行失败，开始恢复并由 AI 判断下一阶段。"
+          const startMessage = shouldRunTriage
+            ? "Issue 已进入评估阶段，AI 将判断下一阶段。"
+            : input.triggerType === "retry_failed"
+              ? "检测到上次执行失败，开始恢复并继续由同一 Codex 会话处理。"
               : input.triggerType === "stale_recovery"
-                ? "检测到任务状态长期停留在处理中，开始自动恢复并由 AI 判断下一阶段。"
-                : `收到新反馈（${triggerTypeLabel(input.triggerType)}），已转交同一 AI 会话判断下一阶段。`;
-          await threadBatcher.push(startMessage, { immediate: true });
+                ? "检测到任务状态长期停留在处理中，开始自动恢复并继续由同一 Codex 会话处理。"
+                : `收到新反馈（${triggerTypeLabel(input.triggerType)}），已直接转交同一 Codex 会话处理。`;
+          await threadBatcher.push(
+            `${startMessage}\n${buildCodexSessionIntroMessage(currentCodexSessionId)}`,
+            { immediate: true }
+          );
         }
 
         let triageReason = String(input.existingRecord?.summary ?? "").trim();
         let needsProcessing = true;
         let triageNextStep: "implement" | "plan" | "confirm" | "ignore" = "implement";
 
-        if (explicitApprovalSignal) {
-          needsProcessing = true;
-          triageNextStep = "implement";
-          if (!triageReason) {
-            triageReason = "检测到用户已明确批准，直接进入实现阶段。";
-          }
-          if (input.notifier && threadTs) {
-            await threadBatcher.push("检测到用户明确批准，跳过重新评估，直接进入实现阶段。");
-          }
-        } else {
+        if (shouldRunTriage) {
           const triageRelay = createCodexProgressRelay(
             async (message) => {
               await threadBatcher.push(message);
@@ -568,9 +690,11 @@ export class IssueEngine {
                     : "决定：进入开发处理。"
             );
           }
+        } else if (input.notifier && threadTs) {
+          await threadBatcher.push("已跳过 Triage，直接将消息转发给同一 Codex 会话处理。");
         }
 
-        if (!needsProcessing || triageNextStep === "ignore") {
+        if (shouldRunTriage && (!needsProcessing || triageNextStep === "ignore")) {
           await this.createIssueCommentIfNeeded(
             input.github,
             input.issueNumber,
@@ -592,7 +716,7 @@ export class IssueEngine {
           return;
         }
 
-        if (triageNextStep === "confirm") {
+        if (shouldRunTriage && triageNextStep === "confirm") {
           const existingPlan = String(input.existingRecord?.solution || "").trim();
           await this.createIssueCommentIfNeeded(
             input.github,
@@ -620,7 +744,7 @@ export class IssueEngine {
           return;
         }
 
-        if (input.config.global.planMode && triageNextStep === "plan") {
+        if (shouldRunTriage && input.config.global.planMode && triageNextStep === "plan") {
           if (input.notifier && threadTs) {
             await threadBatcher.push("Plan 模式已开启，先生成详细方案并等待审批。");
           }
@@ -637,7 +761,7 @@ export class IssueEngine {
               workspace.contextFile,
               input.issueNumber,
               issueTitle,
-              buildPlanOnlyUserMessage(implementUserMessage, triageReason),
+              implementUserMessage,
               workspace.worktreePath,
               async (update) => {
                 await planningRelay.push(update);
@@ -685,13 +809,15 @@ export class IssueEngine {
           return;
         }
 
-        await this.createIssueCommentIfNeeded(
-          input.github,
-          input.issueNumber,
-          input.repo.implementWording,
-          issueComments,
-          `${cycleId}:implement`
-        );
+        if (shouldRunTriage) {
+          await this.createIssueCommentIfNeeded(
+            input.github,
+            input.issueNumber,
+            input.repo.implementWording,
+            issueComments,
+            `${cycleId}:implement`
+          );
+        }
         await this.deps.runtimeStore.saveRecord(
           baseRecord("scheduled", {
             summary: "",
@@ -834,10 +960,11 @@ export class IssueEngine {
     issue: Record<string, unknown>,
     comments: Record<string, unknown>[],
     imageUrls: string[],
-    github: GitHubClientLike
+    github: GitHubClientLike,
+    existingRecord?: IssueExecutionRecord | null
   ): Promise<WorkspacePreparation> {
     if (this.deps.prepareWorkspace) {
-      return this.deps.prepareWorkspace(repo, issue, comments, imageUrls);
+      return this.deps.prepareWorkspace(repo, issue, comments, imageUrls, existingRecord);
     }
 
     const issueNumber = Number(issue.number);
@@ -948,13 +1075,31 @@ export class IssueEngine {
     currentPrUrl: string;
   }): Promise<string> {
     const existing = String(input.currentPrUrl || "").trim();
+    const repoName = `${input.repo.owner}/${input.repo.repo}`;
+    const workingDir = String(input.workspace.worktreePath || "").trim() || input.repo.localPath;
+    let rejectedExistingPrUrl = "";
+    let rejectedExistingPrState = "";
+
     if (existing) {
-      return existing;
+      const existingState = await this.resolvePullRequestState(existing, repoName, workingDir);
+      if (existingState === "MERGED" || existingState === "CLOSED") {
+        rejectedExistingPrUrl = existing;
+        rejectedExistingPrState = existingState;
+      } else {
+        return existing;
+      }
     }
 
     const autoCreated = await this.tryAutoCreatePullRequest(input);
     if (autoCreated) {
       return autoCreated;
+    }
+
+    if (rejectedExistingPrUrl) {
+      throw new Error(
+        `Implementation returned PR ${rejectedExistingPrUrl}, but it is already ${rejectedExistingPrState}. ` +
+          "A new PR is required. Auto PR creation also failed. Please check git changes/worktree and gh auth."
+      );
     }
 
     throw new Error(
@@ -1004,7 +1149,7 @@ export class IssueEngine {
     }
 
     const title = buildPrTitle(input.issueNumber, input.issueTitle);
-    const body = buildPrBody(input.issueNumber, input.triageReason);
+    const body = buildPrBody(input.issueNumber, input.triageReason, input.repo.prIssueReferenceMode);
     const createResult = await this.exec("gh", [
       "pr",
       "create",
@@ -1025,6 +1170,47 @@ export class IssueEngine {
     }
 
     return extractPrUrlFromText(createResult.stdout) || extractPrUrlFromText(createResult.stderr);
+  }
+
+  private async resolvePullRequestState(
+    prRef: string,
+    repoName: string,
+    workingDir: string
+  ): Promise<"OPEN" | "CLOSED" | "MERGED" | ""> {
+    const ref = String(prRef || "").trim();
+    if (!ref) {
+      return "";
+    }
+
+    const result = await this.exec(
+      "gh",
+      ["pr", "view", ref, "--repo", repoName, "--json", "state,mergedAt,url"],
+      workingDir
+    );
+    if (result.code !== 0) {
+      return "";
+    }
+
+    let payload: Record<string, unknown>;
+    try {
+      payload = JSON.parse(String(result.stdout || "")) as Record<string, unknown>;
+    } catch {
+      return "";
+    }
+
+    const mergedAt = String(payload.mergedAt ?? payload.merged_at ?? "").trim();
+    if (mergedAt) {
+      return "MERGED";
+    }
+
+    const state = String(payload.state || "")
+      .trim()
+      .toUpperCase();
+    if (state === "OPEN" || state === "CLOSED" || state === "MERGED") {
+      return state;
+    }
+
+    return "";
   }
 
   private async resolveCurrentBranch(workingDir: string, preferred?: string): Promise<string> {
@@ -1173,23 +1359,6 @@ function buildIgnoreComment(ignoreWording: string, reason: string): string {
   return [ignoreWording, "", "原因:", normalizedReason].join("\n");
 }
 
-function buildPlanOnlyUserMessage(originalUserMessage: string, triageReason: string): string {
-  return [
-    "当前为 Plan 模式，只输出方案，不进入编码实现。",
-    "要求：",
-    "1. 必须基于当前仓库代码与 issue 上下文。",
-    "2. 输出中文 Markdown，包含 `Summary`、`RootCause`、`Solution` 三个章节。",
-    "3. `Solution` 必须包含详细实现步骤、测试验证方案、风险与回滚方案。",
-    "4. 不要修改任何代码，不要创建 commit，不要创建或更新 PR。",
-    "",
-    "Triage 原因：",
-    triageReason || "(未提供)",
-    "",
-    "用户原始诉求：",
-    originalUserMessage || "(空)"
-  ].join("\n");
-}
-
 function buildPlanProposalComment(
   implementWording: string,
   triageReason: string,
@@ -1272,15 +1441,26 @@ function buildPrTitle(issueNumber: number, issueTitle: string): string {
   return `fix: issue #${issueNumber} ${title}`;
 }
 
-function buildPrBody(issueNumber: number, triageReason: string): string {
+function buildPrBody(
+  issueNumber: number,
+  triageReason: string,
+  prIssueReferenceMode?: "close_keywords" | "refs"
+): string {
   const reason = String(triageReason || "").trim() || "(empty)";
   return [
     `Auto-created by github-issue-hunter for issue #${issueNumber}.`,
     "",
     `Reason: ${reason}`,
     "",
-    `Refs #${issueNumber}`
+    buildPrIssueReferenceLine(issueNumber, prIssueReferenceMode)
   ].join("\n");
+}
+
+function buildPrIssueReferenceLine(issueNumber: number, mode?: "close_keywords" | "refs"): string {
+  if (mode === "refs") {
+    return `Refs #${issueNumber}`;
+  }
+  return `Closes #${issueNumber}`;
 }
 
 function extractPrUrlFromText(text: string): string {
@@ -1633,6 +1813,14 @@ function triggerTypeLabel(triggerType: IssueTaskInput["triggerType"]): string {
   return "新 issue";
 }
 
+function buildCodexSessionIntroMessage(sessionId: string): string {
+  const normalized = String(sessionId || "").trim();
+  if (normalized) {
+    return `Codex Session: \`${normalized}\`（复用）`;
+  }
+  return "Codex Session: 新会话创建中（启动后会回传 sessionId）";
+}
+
 function hasPendingSlackSignal(record: IssueExecutionRecord | null): boolean {
   if (!record) {
     return false;
@@ -1663,6 +1851,34 @@ function findLatestExternalComment(comments: Record<string, unknown>[]): { id: n
   return { id: maxId, createdAt };
 }
 
+function findIssueCommentById(comments: Record<string, unknown>[], targetId: number): {
+  author: string;
+  authorAssociation: string;
+  managed: boolean;
+  preview: string;
+} {
+  const normalizedTargetId = Number(targetId);
+  for (const comment of comments) {
+    const id = Number(comment.id);
+    if (!Number.isFinite(normalizedTargetId) || normalizedTargetId <= 0 || id !== normalizedTargetId) {
+      continue;
+    }
+    const body = String(comment.body ?? "");
+    return {
+      author: String((comment.user as { login?: unknown } | undefined)?.login ?? "-"),
+      authorAssociation: String(comment.author_association ?? "-"),
+      managed: isIssueHunterManagedComment(body),
+      preview: toSingleLinePreview(body)
+    };
+  }
+  return {
+    author: "-",
+    authorAssociation: "-",
+    managed: false,
+    preview: ""
+  };
+}
+
 function withSyntheticSignalComments(
   comments: Record<string, unknown>[],
   triggerType: IssueTaskInput["triggerType"],
@@ -1690,8 +1906,7 @@ function buildImplementUserMessage(
   issue: Record<string, unknown>,
   comments: Record<string, unknown>[],
   triggerType: IssueTaskInput["triggerType"],
-  slackSignalText: string,
-  existingRecord?: IssueExecutionRecord | null
+  slackSignalText: string
 ): string {
   const issueBody = String(issue.body ?? "").trim();
   const issueTitle = String(issue.title ?? "").trim();
@@ -1701,6 +1916,7 @@ function buildImplementUserMessage(
     if (signal) {
       return signal;
     }
+    return "User sent a Slack instruction in the bound thread (message body was empty). Continue with the existing issue context and ask concise clarification in Slack thread only.";
   }
 
   if (triggerType === "new_comment" || triggerType === "approval") {
@@ -1717,71 +1933,6 @@ function buildImplementUserMessage(
     return issueTitle;
   }
   return "Please inspect the current issue context and decide the next implementation steps.";
-}
-
-function buildImplementUserMessageFromApproval(
-  issue: Record<string, unknown>,
-  approvalComment: string,
-  existingRecord?: IssueExecutionRecord | null
-): string {
-  const planSummary = String(existingRecord?.summary || "").trim();
-  const planDetails = String(existingRecord?.solution || "").trim();
-  const issueBody = String(issue.body ?? "").trim();
-  const approvedComment = String(approvalComment || "").trim();
-
-  const message = [
-    "User has explicitly approved the proposal for this issue. Start implementation now.",
-    approvedComment ? `Latest approval comment:\n${approvedComment}` : "",
-    planSummary ? `Approved plan summary:\n${planSummary}` : "",
-    planDetails ? `Approved design and implementation plan:\n${planDetails}` : "",
-    issueBody ? `Original issue body:\n${issueBody}` : ""
-  ]
-    .filter(Boolean)
-    .join("\n\n")
-    .trim();
-
-  return message || "User has explicitly approved. Proceed with implementation now.";
-}
-
-function isExplicitApprovalComment(body: string): boolean {
-  const text = String(body || "").trim();
-  if (!text) {
-    return false;
-  }
-
-  // Only treat short command-like replies as explicit approval.
-  if (text.length > 120) {
-    return false;
-  }
-  if (/^#{1,6}\s/.test(text) || text.includes("```")) {
-    return false;
-  }
-
-  const normalized = text.replace(/\s+/g, " ").trim().toLowerCase();
-  const negativePatterns = [
-    /\bnot\s+approve\b/i,
-    /\bdo\s+not\s+approve\b/i,
-    /\bdisapprove\b/i,
-    /\breject\b/i,
-    /\bwait\b/i,
-    /\bhold\b/i,
-    /不同意/,
-    /不通过/,
-    /不要开始/,
-    /先别做/,
-    /暂不处理/
-  ];
-  if (negativePatterns.some((pattern) => pattern.test(text) || pattern.test(normalized))) {
-    return false;
-  }
-
-  const englishApproval = /^(approve|approved|lgtm)(?:[\s,，。.!！;；:：-].*)?$/i;
-  if (englishApproval.test(normalized)) {
-    return true;
-  }
-
-  const chineseApproval = /^(同意|通过|批准|可以开始|开始实现|按方案实现|按方案处理|继续实现)(?:[，,。.!！;；:：-].*)?$/;
-  return chineseApproval.test(text);
 }
 
 function findLatestExternalCommentBody(comments: Record<string, unknown>[]): string {
@@ -1845,6 +1996,19 @@ function extractIssueHunterIdempotencyKey(body: string): string {
 
 function escapeRegExp(value: string): string {
   return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function toSingleLinePreview(text: string, maxLength = 180): string {
+  const flattened = String(text || "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!flattened) {
+    return "";
+  }
+  if (flattened.length <= maxLength) {
+    return flattened;
+  }
+  return `${flattened.slice(0, Math.max(0, maxLength - 3))}...`;
 }
 
 function createLimiter(concurrency: number) {
@@ -1961,6 +2125,19 @@ function classifyIssueFailure(message: string): { category: IssueFailureCategory
   return { category: "unknown", retryEligible: false };
 }
 
+function isIgnorableWorktreeRemoveError(message: string): boolean {
+  const text = String(message || "").toLowerCase();
+  if (!text) {
+    return false;
+  }
+  return (
+    text.includes("not a working tree") ||
+    text.includes("is not a working tree") ||
+    text.includes("does not exist") ||
+    text.includes("not found")
+  );
+}
+
 function shouldRetryFailedRecord(record: IssueExecutionRecord | null): boolean {
   if (!record || record.state !== "failed") {
     return false;
@@ -2023,9 +2200,16 @@ function buildIssueCycleId(input: {
   latestExternalCommentAt: string;
   lastSlackSignalAt: string;
 }): string {
+  if (input.triggerType === "slack_signal") {
+    const signalAt = String(input.lastSlackSignalAt || "").trim() || "none";
+    return [input.issueKey, input.triggerType, "c0", "none", signalAt]
+      .join("|")
+      .replace(/\s+/g, "_");
+  }
+
   const commentId = Number.isFinite(input.latestExternalCommentId) ? input.latestExternalCommentId : 0;
   const commentAt = String(input.latestExternalCommentAt || "").trim() || "none";
-  const signalAt = String(input.lastSlackSignalAt || "").trim() || "none";
+  const signalAt = "none";
   return [
     input.issueKey,
     input.triggerType,

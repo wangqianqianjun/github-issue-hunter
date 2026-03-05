@@ -10,12 +10,17 @@
 
 ## 最新特性（新增）
 
+- 24x7 运行状态持久化与自动恢复
+  - 用户点击“启动 24x7”后，状态会写入 `serviceState.running=true`
+  - 服务重启时自动读取该状态并恢复运行，无需手动再次点击启动
 - Plan 模式（默认开启）
-  - 当 triage 判断“需要处理”时，先输出详细设计与实现方案并回写到 issue
+  - 仅在“GitHub 新 issue 首次进入”且 triage 判断“需要处理”时，先输出详细设计与实现方案并回写到 issue
   - 系统进入 `awaiting_approval` 状态，等待用户 approve
   - 只有收到 approve 后，才进入实际实现阶段
-- 审批驱动实现
-  - 支持在 issue 评论中使用 `approve / approved / 同意 / 通过 / lgtm / go ahead` 等指令触发实现
+- 会话编排调整（电话机模式）
+  - 只有 GitHub 新 issue 首次进入会走 triage
+  - 同一 issue 下后续 comment 不再 triage，直接转发给同一 Codex session 继续处理
+  - Slack 消息默认直接转发 Codex，不追加额外 prompt
   - Board 中会展示“处理中（含 awaiting_approval）”与“已完成”
 - Slack 消息批量合并
   - 线程进度更新会按时间窗口聚合，减少刷屏
@@ -47,15 +52,17 @@
   - 配置本地仓库路径后，自动识别 `owner/repo`
   - 每仓库独立并发控制
 - 自动处理流程
-  - 发现新 issue -> 回复 triage wording
-  - AI 判断不处理 -> 回复 ignore wording
-  - AI 判断处理
+  - 发现新 issue（首次）-> 回复 triage wording -> AI triage 判断
+  - triage 判断不处理 -> 回复 ignore wording
+  - triage 判断处理
     - Plan 模式开启：先回复 implement wording + 设计方案，等待 approve 后实现
     - Plan 模式关闭：直接回复 implement wording 并进入实现
+  - 同一 issue 后续 comment：直接转发给同一 Codex session（不再重新 triage）
 - 隔离执行
   - 所有代码修改都在 `git worktree` 中完成，避免互相污染
 - PR 与回写
   - 处理完成后回写 `Summary / RootCause / Solution / PR`
+  - 自动建 PR 时可配置 issue 关联策略：`Closes/Fixes/Resolves`（默认）或 `Refs`
 - 看板追踪
   - UI 卡片化展示处理中与已完成 issue
   - 支持查看原始问题、讨论过程、解决方案与 PR 链接
@@ -89,31 +96,66 @@ flowchart TD
 
   D --> E[IssueWorker.runSpecificIssue]
   E --> F[processIssue: 拉issue+comments+图片]
-  F --> G{awaiting_approval且最新评论=明确批准?}
-  G -->|是| H[跳过triage 直接implement]
-  G -->|否| I[runTriage -> AI]
+  F --> G{trigger == new?}
+  G -->|是| I[runTriage -> AI]
+  G -->|否| L[直接 implement]
   I --> J[解析needs_processing/next_step]
   J --> K{next_step}
   K -->|ignore| K1[回复ignore并结束]
   K -->|confirm| K2[回写待确认并保持awaiting_approval]
   K -->|plan且planMode=true| K3[runImplementation仅出方案 -> 回写方案 -> awaiting_approval]
   K -->|implement| L[回复implement wording]
-  H --> L
   L --> M[runImplementation -> AI修复]
   M --> N[ensure PR URL]
   N --> O[回写Summary/RootCause/Solution/PR]
   O --> P[completed]
 ```
 
+### Codex 调用与 Session 复用编排图
+
+```mermaid
+flowchart TD
+  subgraph GitHub链路[GitHub Issue 自动处理链路]
+    G1[runOnce -> collectPendingTasks] --> G2[dispatchWorker 拉起 issue-worker]
+    G2 --> G3[IssueEngine.processIssue]
+    G3 --> G4[从 runtime/issues.json 读取 existing session]
+    G4 --> G5[runTriage / runImplementation]
+    G5 --> G6[CodexRunner 注入 resume session]
+    G6 --> G7[codex exec]
+    G7 --> G8[thread.started 返回新的 thread_id]
+    G8 --> G9[回写 codexSessionId 到 runtime/issues.json]
+    G9 --> G10[同一 issue 后续 comment/slack_signal 继续复用]
+  end
+
+  subgraph Slack链路[Slack 频道直连链路]
+    S1[Socket Mode 收到人类消息] --> S2[extractSocketModeInboundMessage]
+    S2 --> S3{isThreadReply?}
+    S3 -->|否: 频道主流新消息| S4[只给 repo/issue hint]
+    S4 --> S5[不传 session/worktree hint]
+    S5 --> S6[SlackChannelCodexManager 新建 thread session]
+    S3 -->|是: thread 回复| S7[resolveIssueKeyByThreadToken]
+    S7 --> S8[从 runtime/issues.json 读取 session/worktree hint]
+    S8 --> S9[SlackChannelCodexManager 复用 thread session]
+    S6 --> S10[codex exec (无resume)]
+    S9 --> S11[codex exec resume session-id]
+    S10 --> S12[thread.started -> 更新 sessionId]
+    S11 --> S12
+    S12 --> S13[持久化到 runtime/slack-channel-sessions.json]
+    S13 --> S14[同一 Slack thread 后续消息继续复用]
+  end
+
+  G9 -. issue线程消息映射 .-> S8
+```
+
 ### 哪些 comment 会交给 AI agent 处理
 
 1. GitHub issue 正文与评论会进入 `context.json`，用于 triage/implement。  
    代码：`src/core/issue-engine.ts`（`prepareWorkspace` 前后）
-2. `new_comment` 触发后默认先交给 AI triage（由 AI 决定下一阶段）。  
-   代码：`src/core/issue-engine.ts`（`runTriage` 分支）
-3. `awaiting_approval` 阶段若最新评论是“明确批准短评论”，跳过 triage 直接 implement。  
-   代码：`src/core/issue-engine.ts`（`isExplicitApprovalComment`）
-4. Slack issue-thread 消息先写入 `lastSlackSignalText`，再由 issue 主流程调度 AI。  
+2. `new`（GitHub 新 issue 首次）触发时，会先进入 AI triage。  
+   代码：`src/core/issue-engine.ts`（`shouldRunTriage` + `runTriage` 分支）
+3. `new_comment / slack_signal / retry_failed / stale_recovery` 不再进入 triage，直接转发给 implement 阶段并复用会话。  
+   代码：`src/core/issue-engine.ts`（`shouldRunTriage === false` 分支）
+4. Slack issue-thread 消息先写入 `lastSlackSignalText`，再由 issue 主流程调度 AI implement。  
    代码：`src/core/issue-hunter-service.ts`（`registerSlackSignal`）
 5. Slack channel/thread 消息走 `SlackChannelCodexManager`，直接拉起/续接 codex 会话。  
    代码：`src/core/slack-channel-codex-manager.ts`
@@ -127,7 +169,6 @@ flowchart TD
 | `src/chat/vercel-chat-bridge.ts` | Slack事件类型 | `type === "message"` 或 `type === "app_mention"`；`subtype` 白名单/黑名单（如 `message_replied`, `thread_broadcast`, `bot_message`） |
 | `src/chat/vercel-chat-bridge.ts` | 人类消息过滤 | 必须有 `client_msg_id`，且过滤 bot/user=self |
 | `src/core/issue-engine.ts` | 新评论触发重处理 | `latestExternalCommentId > lastExternalCommentId` |
-| `src/core/issue-engine.ts` | 明确批准直达实现 | 长度 `<=120`；拒绝 `#` 标题/代码块；负向词：`not approve`, `do not approve`, `disapprove`, `reject`, `wait`, `hold`, `不同意`, `不通过`, `不要开始`, `先别做`, `暂不处理`；正向英文：`approve`, `approved`, `lgtm`；正向中文：`同意`, `通过`, `批准`, `可以开始`, `开始实现`, `按方案实现`, `按方案处理`, `继续实现` |
 | `src/core/issue-engine.ts` | triage `next_step` 映射 | implement：`implement/execute/process/进入开发/开始实现/处理`；plan：`plan/design/update/update_plan/await_approval/awaiting_approval/等待审批/设计/更新方案/先出方案`；confirm：`confirm/await_confirm/awaiting_confirm/等待确认/待确认`；ignore：`ignore/skip/no_action/不处理/暂不处理/忽略` |
 | `src/core/issue-engine.ts` | bot评论识别/幂等 | marker: `<!-- issue-hunter:auto -->`；idempotency正则：`/<!--\s*issue-hunter:idempotency:([^\s]+)\s*-->/i` |
 | `src/core/issue-engine.ts` | issue/评论图片提取 | Markdown图：`/!\[[^\]]*\]\(([^)\s]+)\)/g`；HTML图：`/<img[^>]*src=["']([^"']+)["'][^>]*>/gi` |
@@ -204,9 +245,10 @@ npm run service:stop
 ## 基本使用
 
 1. 打开 UI，先配置全局参数（轮询间隔、并发、工作目录、Plan 模式）
-2. 在仓库配置中填写本地路径并保存
+2. 在仓库配置中填写本地路径并保存（可选设置 PR issue 关联策略：自动关闭或仅关联）
 3. （可选）在 Slack Tab 完成 Bot/App Token 配置并绑定频道
 4. 启动 `24x7`，或先点“立即轮询一次”验证流程
+5. 24x7 启动状态会自动持久化；重启服务后会自动恢复到上次运行状态
 
 ## 运行数据目录
 

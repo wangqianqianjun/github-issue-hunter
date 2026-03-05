@@ -230,7 +230,9 @@ export class IssueHunterService {
         new GhCliClient({
           owner: repo.owner,
           repo: repo.repo,
-          localPath: repo.localPath
+          localPath: repo.localPath,
+          mediaRepo: repo.mediaRepo,
+          mediaBranch: repo.mediaBranch
         }),
       codexFactory: () =>
         new CodexRunner({
@@ -246,6 +248,15 @@ export class IssueHunterService {
     });
   }
 
+  async resumeFromServiceState(): Promise<boolean> {
+    const config = await this.configStore.load();
+    if (!config.serviceState.running) {
+      return false;
+    }
+    await this.start();
+    return true;
+  }
+
   async start(): Promise<void> {
     if (this.timer) {
       return;
@@ -258,10 +269,11 @@ export class IssueHunterService {
 
     this.status.running = true;
     this.status.lastHealthAt = new Date().toISOString();
+    const startStats = this.getTaskStats();
     await this.configStore.updateServiceState({
       running: true,
       lastError: "",
-      activeTasks: this.workersByIssueKey.size,
+      activeTasks: startStats.activeTasks,
       lastHealthAt: this.status.lastHealthAt
     });
 
@@ -306,10 +318,11 @@ export class IssueHunterService {
 
     this.status.running = false;
     this.status.lastHealthAt = new Date().toISOString();
+    const stopStats = this.getTaskStats();
     await this.chatBridge.shutdown().catch(() => undefined);
     await this.configStore.updateServiceState({
       running: false,
-      activeTasks: this.workersByIssueKey.size,
+      activeTasks: stopStats.activeTasks,
       lastHealthAt: this.status.lastHealthAt
     });
   }
@@ -325,14 +338,15 @@ export class IssueHunterService {
 
   async getStatus(): Promise<ServiceStatus> {
     const config = await this.configStore.load();
+    const taskStats = this.getTaskStats();
     const merged: ServiceStatus = {
       ...this.status,
       running: Boolean(this.timer),
-      activeTasks: this.workersByIssueKey.size,
+      activeTasks: taskStats.activeTasks,
       lastRunAt: this.status.lastRunAt || config.serviceState.lastRunAt,
       lastError: this.status.lastError || config.serviceState.lastError,
       lastHealthAt: this.status.lastHealthAt || config.serviceState.lastHealthAt || "",
-      queueLength: 0
+      queueLength: taskStats.queueLength
     };
     return merged;
   }
@@ -495,7 +509,9 @@ export class IssueHunterService {
         const github = new GhCliClient({
           owner: repo.owner,
           repo: repo.repo,
-          localPath: repo.localPath
+          localPath: repo.localPath,
+          mediaRepo: repo.mediaRepo,
+          mediaBranch: repo.mediaBranch
         });
 
         const issue = await github.getIssue(normalizedIssueNumber);
@@ -669,20 +685,21 @@ export class IssueHunterService {
           lastError: message,
           lastRunAt: new Date().toISOString(),
           running: Boolean(this.timer),
-          activeTasks: this.workersByIssueKey.size,
+          activeTasks: this.getTaskStats().activeTasks,
           lastHealthAt: new Date().toISOString()
         });
 
         throw error;
       } finally {
-        this.status.activeTasks = this.workersByIssueKey.size;
+        this.status.activeTasks = this.getTaskStats().activeTasks;
         this.status.lastHealthAt = new Date().toISOString();
         this.maybeLogHealthSummary();
+        const taskStats = this.getTaskStats();
         await this.configStore.updateServiceState({
           running: Boolean(this.timer),
           lastRunAt: this.status.lastRunAt,
           lastError: this.status.lastError,
-          activeTasks: this.workersByIssueKey.size,
+          activeTasks: taskStats.activeTasks,
           lastHealthAt: this.status.lastHealthAt
         });
       }
@@ -855,6 +872,10 @@ export class IssueHunterService {
     for (const alias of aliases) {
       const issueKey = this.issueKeyByThreadToken.get(alias);
       if (issueKey) {
+        // eslint-disable-next-line no-console
+        console.info(
+          `[issue-hunter][routing] source=memory_map thread=${threadToken} alias=${alias} issue=${issueKey}`
+        );
         return issueKey;
       }
     }
@@ -867,15 +888,25 @@ export class IssueHunterService {
       }
       const recordAliases = deriveThreadTokenAliases(thread);
       if (aliases.some((alias) => recordAliases.includes(alias))) {
+        // eslint-disable-next-line no-console
+        console.info(
+          `[issue-hunter][routing] source=runtime_record thread=${threadToken} record_thread=${thread} issue=${record.issueKey}`
+        );
         return record.issueKey;
       }
     }
 
     const recoveredIssueKey = await this.resolveIssueKeyFromSlackRootMessage(threadToken);
     if (recoveredIssueKey) {
+      // eslint-disable-next-line no-console
+      console.info(
+        `[issue-hunter][routing] source=slack_root_message thread=${threadToken} issue=${recoveredIssueKey}`
+      );
       return recoveredIssueKey;
     }
 
+    // eslint-disable-next-line no-console
+    console.info(`[issue-hunter][routing] source=none thread=${threadToken} issue=-`);
     return "";
   }
 
@@ -885,6 +916,10 @@ export class IssueHunterService {
   ): Promise<{ accepted: boolean; issueKey: string; message: string }> {
     const issueKey = await this.resolveIssueKeyByThreadToken(threadToken);
     if (!issueKey) {
+      // eslint-disable-next-line no-console
+      console.info(
+        `[issue-hunter][slack_signal] dropped thread=${threadToken} reason=no_issue_binding text="${toSingleLinePreview(text)}"`
+      );
       return {
         accepted: false,
         issueKey: "",
@@ -905,19 +940,30 @@ export class IssueHunterService {
     }
 
     const now = new Date().toISOString();
+    const currentSessionId = String(
+      existing.codexSessionId || existing.implementSessionId || existing.triageSessionId || ""
+    ).trim();
     await this.runtimeStore.saveRecord({
       ...existing,
       lastSlackSignalAt: now,
       lastSlackSignalText: String(text || "").trim(),
       updatedAt: now
     });
+    // eslint-disable-next-line no-console
+    console.info(
+      `[issue-hunter][slack_signal] accepted issue=${issueKey} thread=${threadToken} ` +
+        `existing_state=${existing.state} existing_session=${String(existing.codexSessionId || existing.implementSessionId || existing.triageSessionId || "").trim() || "-"} ` +
+        `existing_worktree=${String(existing.issueWorktreePath || "").trim() || "-"} text="${toSingleLinePreview(text)}"`
+    );
 
     void this.runOnceSafe().catch(() => undefined);
 
     return {
       accepted: true,
       issueKey,
-      message: `已记录指令（${issueKey}），下一轮将由 AI 重新评估是否继续处理。`
+      message: `已记录指令（${issueKey}），下一轮将由 AI 重新评估是否继续处理。Codex Session: ${
+        currentSessionId ? `\`${currentSessionId}\`` : "新会话创建中（启动后会回传 sessionId）"
+      }`
     };
   }
 
@@ -1012,6 +1058,23 @@ export class IssueHunterService {
       ? `slack:${parsedThread.channelId}:${parsedThread.threadTs}`
       : String(threadToken || "").trim();
     const recoveredSessionId = await this.loadCodexSessionIdFromChannelSessions(threadToken);
+    let lastExternalCommentId = 0;
+    let lastExternalCommentAt = "";
+    try {
+      const github = new GhCliClient({
+        owner: repo.owner,
+        repo: repo.repo,
+        localPath: repo.localPath,
+        mediaRepo: repo.mediaRepo,
+        mediaBranch: repo.mediaBranch
+      });
+      const comments = await github.listIssueComments(parsedIssue.issueNumber);
+      const latestExternal = findLatestExternalIssueComment(comments);
+      lastExternalCommentId = latestExternal.id;
+      lastExternalCommentAt = latestExternal.createdAt;
+    } catch {
+      // Keep default zero baseline when comments cannot be loaded during recovery.
+    }
 
     const fallbackRecord: IssueExecutionRecord = {
       issueKey,
@@ -1024,8 +1087,8 @@ export class IssueHunterService {
       solution: "",
       closedAt: "",
       threadTs: normalizedThreadToken,
-      lastExternalCommentId: 0,
-      lastExternalCommentAt: "",
+      lastExternalCommentId,
+      lastExternalCommentAt,
       lastSlackSignalAt: "",
       lastHandledSlackSignalAt: "",
       lastSlackSignalText: "",
@@ -1071,34 +1134,76 @@ export class IssueHunterService {
     channelId: string;
     text: string;
     isMention: boolean;
+    isThreadReply: boolean;
     post: (text: string) => Promise<void>;
   }): Promise<ChannelMessageResult> {
     let repoIdHint = "";
     let codexSessionIdHint = "";
     let issueKeyHint = "";
-
-    const issueKey = await this.resolveIssueKeyByThreadToken(input.threadId);
-    if (issueKey) {
-      issueKeyHint = issueKey;
-      const record = await this.runtimeStore.getRecord(issueKey);
-      if (record) {
-        repoIdHint = String(record.repoId || "").trim();
-        codexSessionIdHint = String(
-          record.codexSessionId || record.implementSessionId || record.triageSessionId || ""
-        ).trim();
+    let issueWorktreePathHint = "";
+    let issueWorktreeBranchHint = "";
+    const config = await this.configStore.load();
+    if (input.isThreadReply) {
+      // Thread replies are continuation of an existing conversation and may reuse issue/session/worktree bindings.
+      const issueKey = await this.resolveIssueKeyByThreadToken(input.threadId);
+      if (issueKey) {
+        issueKeyHint = issueKey;
+        const record = await this.runtimeStore.getRecord(issueKey);
+        if (record) {
+          repoIdHint = String(record.repoId || "").trim();
+          codexSessionIdHint = String(
+            record.codexSessionId || record.implementSessionId || record.triageSessionId || ""
+          ).trim();
+          issueWorktreePathHint = String(record.issueWorktreePath || "").trim();
+          issueWorktreeBranchHint = String(record.issueWorktreeBranch || "").trim();
+        } else {
+          const parsed = parseIssueKeyStrict(issueKey);
+          if (parsed) {
+            const repo = config.repositories.find(
+              (item) => item.enabled && item.owner === parsed.owner && item.repo === parsed.repo
+            );
+            if (repo) {
+              repoIdHint = repo.id;
+            }
+          }
+        }
+      }
+    } else {
+      // Channel main-stream messages always start a new Codex session.
+      // We only derive repo/issue hints for routing/context, never reuse prior session/worktree.
+      const fromUrl = extractIssueRefFromText(input.text);
+      if (fromUrl) {
+        const matchedRepo = config.repositories.find(
+          (repo) => repo.enabled && repo.owner === fromUrl.owner && repo.repo === fromUrl.repo
+        );
+        if (matchedRepo) {
+          issueKeyHint = `${fromUrl.owner}/${fromUrl.repo}#${fromUrl.issueNumber}`;
+          repoIdHint = matchedRepo.id;
+        }
       } else {
-        const parsed = parseIssueKeyStrict(issueKey);
-        if (parsed) {
-          const config = await this.configStore.load();
-          const repo = config.repositories.find(
-            (item) => item.enabled && item.owner === parsed.owner && item.repo === parsed.repo
+        const numberMatch = String(input.text || "").match(/\bissue\s*#(\d+)\b/i);
+        const issueNumber = Number(numberMatch?.[1] || 0);
+        if (Number.isFinite(issueNumber) && issueNumber > 0) {
+          const matchedByChannel = config.repositories.filter(
+            (repo) =>
+              repo.enabled &&
+              repo.slack.enabled &&
+              String(repo.slack.channelId || "").trim() === String(input.channelId || "").trim()
           );
-          if (repo) {
+          if (matchedByChannel.length === 1) {
+            const repo = matchedByChannel[0];
+            issueKeyHint = `${repo.owner}/${repo.repo}#${issueNumber}`;
             repoIdHint = repo.id;
           }
         }
       }
     }
+    // eslint-disable-next-line no-console
+    console.info(
+      `[issue-hunter][channel_message] thread=${input.threadId} channel=${input.channelId} mention=${input.isMention} ` +
+        `issue_hint=${issueKeyHint || "-"} repo_hint=${repoIdHint || "-"} session_hint=${codexSessionIdHint || "-"} ` +
+        `worktree_hint=${issueWorktreePathHint || "-"} text="${toSingleLinePreview(input.text)}"`
+    );
 
     const result = await this.slackChannelCodexManager.handleMessage({
       threadId: input.threadId,
@@ -1108,8 +1213,16 @@ export class IssueHunterService {
       post: input.post,
       repoIdHint,
       codexSessionIdHint,
-      issueKeyHint
+      issueKeyHint,
+      issueWorktreePathHint,
+      issueWorktreeBranchHint
     });
+    // eslint-disable-next-line no-console
+    console.info(
+      `[issue-hunter][channel_message] result thread=${input.threadId} accepted=${result.accepted} message="${toSingleLinePreview(
+        result.message
+      )}"`
+    );
     return result;
   }
 
@@ -1178,7 +1291,7 @@ export class IssueHunterService {
     });
 
     await this.configStore.updateServiceState({
-      activeTasks: this.workersByIssueKey.size,
+      activeTasks: this.getTaskStats().activeTasks,
       running: Boolean(this.timer)
     });
   }
@@ -1276,11 +1389,19 @@ export class IssueHunterService {
       });
     }
 
-    this.status.activeTasks = this.workersByIssueKey.size;
+    this.status.activeTasks = this.getTaskStats().activeTasks;
     await this.configStore.updateServiceState({
-      activeTasks: this.workersByIssueKey.size,
+      activeTasks: this.status.activeTasks,
       running: Boolean(this.timer)
     });
+  }
+
+  private getTaskStats(): { activeTasks: number; queueLength: number } {
+    const channelLoad = this.slackChannelCodexManager.getLoadSnapshot();
+    return {
+      activeTasks: this.workersByIssueKey.size + channelLoad.runningTasks,
+      queueLength: channelLoad.queuedTasks
+    };
   }
 
   private async markIssueFailedIfNeeded(
@@ -1340,6 +1461,31 @@ function parseIssueKey(issueKey: string, fallbackIssueNumber: number): { repoFul
     repoFullName: match[1],
     issueNumber: Number(match[2]) || fallbackIssueNumber
   };
+}
+
+const ISSUE_HUNTER_COMMENT_MARKER = "<!-- issue-hunter:auto -->";
+
+function isIssueHunterManagedComment(body: string): boolean {
+  return String(body || "").includes(ISSUE_HUNTER_COMMENT_MARKER);
+}
+
+function findLatestExternalIssueComment(comments: Record<string, unknown>[]): { id: number; createdAt: string } {
+  let maxId = 0;
+  let createdAt = "";
+  for (const comment of comments) {
+    const body = String(comment.body ?? "");
+    if (isIssueHunterManagedComment(body)) {
+      continue;
+    }
+
+    const id = Number(comment.id);
+    if (!Number.isFinite(id) || id <= maxId) {
+      continue;
+    }
+    maxId = id;
+    createdAt = String(comment.created_at ?? comment.updated_at ?? "");
+  }
+  return { id: maxId, createdAt };
 }
 
 function parseRegressionCaseFilename(fileName: string): { repoId: string; issueNumber: number } | null {
@@ -1655,7 +1801,8 @@ export async function prepareWorkspaceWithConfig(
   repo: RepositoryConfig,
   issue: Record<string, unknown>,
   comments: Record<string, unknown>[],
-  imageUrls: string[]
+  imageUrls: string[],
+  existingRecord?: IssueExecutionRecord | null
 ) {
   const config = await configStore.load();
   const workspaceRoot = resolve(config.global.workspaceDir || ".");
@@ -1667,9 +1814,11 @@ export async function prepareWorkspaceWithConfig(
   const github = new GhCliClient({
     owner: repo.owner,
     repo: repo.repo,
-    localPath: repo.localPath
+    localPath: repo.localPath,
+    mediaRepo: repo.mediaRepo,
+    mediaBranch: repo.mediaBranch
   });
-  return manager.prepare(repo, issue, comments, imageUrls, github);
+  return manager.prepare(repo, issue, comments, imageUrls, github, existingRecord);
 }
 
 export async function writeRegressionCaseWithRuntime(
@@ -1680,4 +1829,17 @@ export async function writeRegressionCaseWithRuntime(
   result: Record<string, unknown>
 ): Promise<void> {
   await writeRegressionCase(regressionDir, repo, issueNumber, issueTitle, result);
+}
+
+function toSingleLinePreview(text: string, maxLength = 180): string {
+  const flattened = String(text || "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!flattened) {
+    return "";
+  }
+  if (flattened.length <= maxLength) {
+    return flattened;
+  }
+  return `${flattened.slice(0, Math.max(0, maxLength - 3))}...`;
 }

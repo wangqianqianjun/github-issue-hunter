@@ -50,12 +50,7 @@ export class CodexRunner implements CodexRunnerLike {
     abortSignal?: AbortSignal,
     resumeSessionId?: string
   ): Promise<Record<string, unknown>> {
-    const commandTemplate = ensureImplementUserMessagePlaceholder(
-      ensureResumeClausePlaceholder(this.options.implementCommand)
-    );
-    const implementUserMessage = shouldInjectContextIntoImplementMessage(commandTemplate)
-      ? buildContextualImplementUserMessage(contextFile, issueNumber, issueTitle, originalUserMessage)
-      : originalUserMessage;
+    const commandTemplate = ensureImplementUserMessagePlaceholder(ensureResumeClausePlaceholder(this.options.implementCommand));
     return runCodexCommand(
       commandTemplate,
       {
@@ -63,7 +58,7 @@ export class CodexRunner implements CodexRunnerLike {
         issue_number: String(issueNumber),
         issue_title: issueTitle,
         worktree: workingDirectory ?? this.options.defaultWorkingDirectory,
-        implement_user_message: shellQuote(implementUserMessage),
+        implement_user_message: shellQuote(originalUserMessage),
         resume_clause: buildResumeClause(resumeSessionId),
         resume_session: shellQuote(String(resumeSessionId || "").trim())
       },
@@ -150,45 +145,6 @@ export function parseTriageFromOutput(output: string): Record<string, unknown> {
     evidence: extractMarkdownSection(text, "Evidence"),
     markdown: text
   };
-}
-
-export function shouldInjectContextIntoImplementMessage(commandTemplate: string): boolean {
-  const text = String(commandTemplate || "").trim();
-  if (!text) {
-    return false;
-  }
-  if (!/^codex\s+exec\b/i.test(text)) {
-    return false;
-  }
-  if (text.includes("{context_file}")) {
-    return false;
-  }
-  return true;
-}
-
-export function buildContextualImplementUserMessage(
-  contextFile: string,
-  issueNumber: number,
-  issueTitle: string,
-  originalUserMessage: string
-): string {
-  const issueNum = Number.isFinite(issueNumber) ? String(issueNumber) : "unknown";
-  const title = String(issueTitle || "").trim();
-  const userMessage = String(originalUserMessage || "").trim() || "(empty user message)";
-  const contextPath = String(contextFile || "").trim();
-
-  const header = title ? `GitHub issue #${issueNum}: ${title}` : `GitHub issue #${issueNum}`;
-  return [
-    "[System context for this turn]",
-    `You are continuing work for ${header}.`,
-    `First read the issue context JSON file: ${contextPath}`,
-    "Then use the issue context and current repository code as the source of truth.",
-    "Process the ORIGINAL user message below in this same issue context.",
-    "Do not ask detached scoping questions that ignore the issue context.",
-    "",
-    "[Original user message]",
-    userMessage
-  ].join("\n");
 }
 
 export function parseImplementationFromOutput(output: string): Record<string, unknown> {
@@ -359,7 +315,11 @@ async function runShell(
         if (threadId) {
           codexThreadId = threadId;
         }
-        await emitProgress("System: Codex 会话已启动");
+        await emitProgress(
+          threadId
+            ? `System: Codex 会话已启动 (session: ${threadId})`
+            : "System: Codex 会话已启动"
+        );
         return;
       }
 

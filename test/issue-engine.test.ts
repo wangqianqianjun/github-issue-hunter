@@ -13,6 +13,7 @@ class FakeGitHubClient {
   comments: string[] = [];
   closed: number[] = [];
   issueComments: Record<string, unknown>[];
+  openIssuesOverride: Record<string, unknown>[] | null = null;
 
   constructor(
     private readonly issue: Record<string, unknown>,
@@ -22,6 +23,9 @@ class FakeGitHubClient {
   }
 
   async listOpenIssues(): Promise<Record<string, unknown>[]> {
+    if (this.openIssuesOverride) {
+      return this.openIssuesOverride;
+    }
     return [this.issue];
   }
 
@@ -144,6 +148,10 @@ class FakeRuntimeStore {
   async listCompleted(): Promise<IssueExecutionRecord[]> {
     return this.records.filter((item) => item.state === "completed");
   }
+
+  async listAll(): Promise<IssueExecutionRecord[]> {
+    return [...this.records];
+  }
 }
 
 type CommandResult = {
@@ -158,6 +166,18 @@ type CommandCall = {
   cwd?: string;
 };
 
+function extractPrCreateBody(calls: CommandCall[]): string {
+  const call = calls.find((item) => item.command === "gh" && item.args[0] === "pr" && item.args[1] === "create");
+  if (!call) {
+    return "";
+  }
+  const bodyIndex = call.args.indexOf("--body");
+  if (bodyIndex < 0) {
+    return "";
+  }
+  return String(call.args[bodyIndex + 1] || "");
+}
+
 const makeRepo = (id: string, owner: string, repo: string): RepositoryConfig => ({
   id,
   owner,
@@ -168,6 +188,7 @@ const makeRepo = (id: string, owner: string, repo: string): RepositoryConfig => 
   triageWording: DEFAULT_TRIAGE_WORDING,
   implementWording: DEFAULT_IMPLEMENT_WORDING,
   ignoreWording: DEFAULT_IGNORE_WORDING,
+  prIssueReferenceMode: "close_keywords",
   enabled: true,
   perRepoConcurrency: 1,
   slack: {
@@ -340,7 +361,7 @@ describe("IssueEngine", () => {
       issueKey: "acme/web#13",
       repoId: repo.id,
       issueNumber: 13,
-      state: "completed",
+      state: "implementing",
       summary: "done",
       prUrl: "https://github.com/acme/web/pull/13",
       rootCause: "na",
@@ -367,7 +388,7 @@ describe("IssueEngine", () => {
     expect(gh.comments).toEqual([]);
   });
 
-  it("retries seen issue when previous state is failed", async () => {
+  it("retries seen failed issue by forwarding directly to implementation", async () => {
     const previousAutoRetry = process.env.FAILED_ISSUE_AUTO_RETRY;
     process.env.FAILED_ISSUE_AUTO_RETRY = "1";
     const repo = makeRepo("repo-a", "acme", "web");
@@ -402,7 +423,13 @@ describe("IssueEngine", () => {
       codexFactory: () =>
         new FakeCodexRunner(
           { needs_processing: false, reason: "not planned" },
-          {}
+          {
+            summary: "retry fix applied",
+            root_cause: "transient failure",
+            solution: "rerun with latest context",
+            pr_url: "https://github.com/acme/web/pull/14",
+            test_cases: []
+          }
         ),
       notifierFactory: () => null,
       writeBoard: async () => undefined,
@@ -420,12 +447,11 @@ describe("IssueEngine", () => {
       }
     }
 
-    expect(gh.comments.some((item) => item.includes(DEFAULT_TRIAGE_WORDING))).toBe(true);
-    expect(gh.comments.some((item) => item.includes(DEFAULT_IGNORE_WORDING))).toBe(true);
-    expect(gh.comments.some((item) => item.includes("原因:\nnot planned"))).toBe(true);
+    expect(gh.comments.some((item) => item.includes(DEFAULT_TRIAGE_WORDING))).toBe(false);
+    expect(gh.comments.some((item) => item.includes("PR:\nhttps://github.com/acme/web/pull/14"))).toBe(true);
   });
 
-  it("recovers stale in-flight issue when triaging state is outdated", async () => {
+  it("recovers stale in-flight issue by forwarding directly to implementation", async () => {
     const previousStaleSeconds = process.env.ISSUE_HUNTER_STALE_IN_FLIGHT_RETRY_SECONDS;
     process.env.ISSUE_HUNTER_STALE_IN_FLIGHT_RETRY_SECONDS = "60";
 
@@ -456,7 +482,13 @@ describe("IssueEngine", () => {
 
     const codex = new FakeCodexRunner(
       { needs_processing: false, reason: "already fixed" },
-      {}
+      {
+        summary: "stale task recovered",
+        root_cause: "worker stalled",
+        solution: "resume and complete",
+        pr_url: "https://github.com/acme/web/pull/185",
+        test_cases: []
+      }
     );
 
     const engine = new IssueEngine({
@@ -481,12 +513,13 @@ describe("IssueEngine", () => {
     }
 
     const record = await runtime.getRecord(issueKey);
-    expect(codex.triageRuns).toBe(1);
-    expect(record?.state).toBe("ignored");
+    expect(codex.triageRuns).toBe(0);
+    expect(codex.implementRuns).toBe(1);
+    expect(record?.state).toBe("completed");
     expect(record?.lastTriggerType).toBe("stale_recovery");
   });
 
-  it("re-triages completed issue when new github comment appears", async () => {
+  it("forwards completed issue new github comment directly to implementation", async () => {
     const repo = makeRepo("repo-a", "acme", "web");
     const config = makeConfig([repo]);
     const gh = new FakeGitHubClient(
@@ -519,7 +552,13 @@ describe("IssueEngine", () => {
 
     const codex = new FakeCodexRunner(
       { needs_processing: false, reason: "already fixed after re-check" },
-      {}
+      {
+        summary: "follow-up handled",
+        root_cause: "additional edge case",
+        solution: "applied follow-up patch",
+        pr_url: "https://github.com/acme/web/pull/660",
+        test_cases: []
+      }
     );
 
     const engine = new IssueEngine({
@@ -534,10 +573,71 @@ describe("IssueEngine", () => {
     });
 
     await engine.runOnce();
-    expect(codex.triageRuns).toBe(1);
+    expect(codex.triageRuns).toBe(0);
+    expect(codex.implementRuns).toBe(1);
   });
 
-  it("re-triages failed issue when new github comment appears", async () => {
+  it("includes reused codex session id in first thread update on follow-up comments", async () => {
+    const repo = makeRepo("repo-a", "acme", "web");
+    const config = makeConfig([repo]);
+    const gh = new FakeGitHubClient(
+      {
+        number: 167,
+        title: "follow-up with reused session",
+        body: "issue body",
+        html_url: "https://github.com/acme/web/issues/167"
+      },
+      [{ id: 7002, body: "继续修复这个问题", created_at: "2026-03-04T00:00:00.000Z" }]
+    );
+
+    const runtime = new FakeRuntimeStore();
+    const issueKey = "acme/web#167";
+    await runtime.markSeen(issueKey);
+    await runtime.saveRecord({
+      issueKey,
+      repoId: repo.id,
+      issueNumber: 167,
+      state: "completed",
+      summary: "previous run",
+      prUrl: "https://github.com/acme/web/pull/167",
+      rootCause: "na",
+      solution: "na",
+      closedAt: "2026-03-03T00:00:00.000Z",
+      threadTs: "",
+      lastExternalCommentId: 7001,
+      codexSessionId: "sess-reuse-167",
+      updatedAt: new Date().toISOString()
+    });
+
+    const notifier = new FakeNotifier();
+    const codex = new FakeCodexRunner(
+      { needs_processing: false, reason: "already addressed" },
+      {
+        summary: "done",
+        root_cause: "na",
+        solution: "na",
+        pr_url: "https://github.com/acme/web/pull/167",
+        test_cases: []
+      }
+    );
+
+    const engine = new IssueEngine({
+      getConfig: async () => config,
+      runtimeStore: runtime,
+      githubFactory: () => gh,
+      codexFactory: () => codex,
+      notifierFactory: () => notifier,
+      writeBoard: async () => undefined,
+      writeRegressionCase: async () => undefined,
+      prepareWorkspace: async () => ({ contextFile: "/tmp/context.json", cleanup: async () => undefined })
+    });
+
+    await engine.runOnce();
+
+    expect(notifier.updates.some((item) => item.text.includes("Codex Session: `sess-reuse-167`（复用）"))).toBe(true);
+  });
+
+  it("forwards failed issue new github comment directly to implementation", async () => {
     const repo = makeRepo("repo-a", "acme", "web");
     const config = makeConfig([repo]);
     const gh = new FakeGitHubClient(
@@ -570,7 +670,13 @@ describe("IssueEngine", () => {
 
     const codex = new FakeCodexRunner(
       { needs_processing: false, reason: "validated with new input" },
-      {}
+      {
+        summary: "fixed after follow-up",
+        root_cause: "missing guard on retry path",
+        solution: "add guard and verify",
+        pr_url: "https://github.com/acme/web/pull/680",
+        test_cases: []
+      }
     );
 
     const engine = new IssueEngine({
@@ -585,7 +691,8 @@ describe("IssueEngine", () => {
     });
 
     await engine.runOnce();
-    expect(codex.triageRuns).toBe(1);
+    expect(codex.triageRuns).toBe(0);
+    expect(codex.implementRuns).toBe(1);
   });
 
   it("passes latest external user comment directly to implement stage", async () => {
@@ -642,8 +749,74 @@ describe("IssueEngine", () => {
     });
 
     await engine.runOnce();
+    expect(codex.triageRuns).toBe(0);
     expect(codex.implementRuns).toBe(1);
     expect(codex.lastImplementUserMessage).toBe("still broken after patch");
+  });
+
+  it("keeps slack-signal implement input isolated from github issue comments", async () => {
+    const repo = makeRepo("repo-a", "acme", "web");
+    const config = makeConfig([repo]);
+    const gh = new FakeGitHubClient(
+      {
+        number: 77,
+        title: "slack follow-up",
+        body: "original issue body",
+        html_url: "https://github.com/acme/web/issues/77"
+      },
+      [{ id: 5001, body: "github comment should not be forwarded in slack trigger", created_at: "2026-03-03T00:00:00.000Z" }]
+    );
+
+    const runtime = new FakeRuntimeStore();
+    const issueKey = "acme/web#77";
+    await runtime.markSeen(issueKey);
+    await runtime.saveRecord({
+      issueKey,
+      repoId: repo.id,
+      issueNumber: 77,
+      state: "completed",
+      summary: "done once",
+      prUrl: "https://github.com/acme/web/pull/77",
+      rootCause: "na",
+      solution: "na",
+      closedAt: "2026-03-02T00:00:00.000Z",
+      threadTs: "slack:C123:1770000000.000001",
+      lastExternalCommentId: 5001,
+      lastExternalCommentAt: "2026-03-03T00:00:00.000Z",
+      lastSlackSignalAt: "2026-03-03T00:05:00.000Z",
+      lastHandledSlackSignalAt: "",
+      lastSlackSignalText: "",
+      updatedAt: new Date().toISOString()
+    });
+
+    const codex = new FakeCodexRunner(
+      { needs_processing: true, reason: "needs processing from slack instruction" },
+      {
+        summary: "done",
+        root_cause: "cause",
+        solution: "solution",
+        pr_url: "https://github.com/acme/web/pull/770",
+        test_cases: []
+      }
+    );
+
+    const engine = new IssueEngine({
+      getConfig: async () => config,
+      runtimeStore: runtime,
+      githubFactory: () => gh,
+      codexFactory: () => codex,
+      notifierFactory: () => null,
+      writeBoard: async () => undefined,
+      writeRegressionCase: async () => undefined,
+      prepareWorkspace: async () => ({ contextFile: "/tmp/context.json", cleanup: async () => undefined })
+    });
+
+    await engine.runOnce();
+
+    expect(codex.triageRuns).toBe(0);
+    expect(codex.implementRuns).toBe(1);
+    expect(codex.lastImplementUserMessage).toContain("User sent a Slack instruction");
+    expect(codex.lastImplementUserMessage).not.toContain("github comment should not be forwarded");
   });
 
   it("enters awaiting approval state in plan mode before implementation", async () => {
@@ -694,9 +867,10 @@ describe("IssueEngine", () => {
     expect(record?.state).toBe("awaiting_approval");
     expect(record?.summary).toBe("valid bug");
     expect(record?.solution).toContain("Summary:");
+    expect(codex.lastImplementUserMessage).toBe("please fix with plan");
   });
 
-  it("enters implementation directly on explicit approval comment in awaiting_approval state", async () => {
+  it("forwards approval comment in awaiting_approval directly to implementation", async () => {
     const repo = makeRepo("repo-a", "acme", "web");
     const config = makeConfig([repo]);
     config.global.planMode = true;
@@ -729,7 +903,7 @@ describe("IssueEngine", () => {
     });
 
     const codex = new FakeCodexRunner(
-      { needs_processing: true, reason: "triage should not run in this case", next_step: "plan" },
+      { needs_processing: true, reason: "approved and ready to implement", next_step: "implement" },
       {
         summary: "done",
         root_cause: "cause",
@@ -754,13 +928,12 @@ describe("IssueEngine", () => {
 
     expect(codex.triageRuns).toBe(0);
     expect(codex.implementRuns).toBe(1);
-    expect(codex.lastImplementUserMessage).toContain("approved");
-    expect(codex.lastImplementUserMessage).toContain("Approved plan summary");
-    expect(gh.comments.some((item) => item.includes(DEFAULT_IMPLEMENT_WORDING))).toBe(true);
+    expect(codex.lastImplementUserMessage).toBe("approve，按方案开始实现");
+    expect(gh.comments.some((item) => item.includes(DEFAULT_IMPLEMENT_WORDING))).toBe(false);
     expect(gh.comments.some((item) => item.includes("PR:\nhttps://github.com/acme/web/pull/171"))).toBe(true);
   });
 
-  it("re-triages awaiting_approval issue on any new comment and keeps waiting when AI chooses plan", async () => {
+  it("forwards awaiting_approval follow-up comment directly to implementation", async () => {
     const repo = makeRepo("repo-a", "acme", "web");
     const config = makeConfig([repo]);
     config.global.planMode = true;
@@ -795,10 +968,10 @@ describe("IssueEngine", () => {
     const codex = new FakeCodexRunner(
       { needs_processing: true, reason: "needs revised plan", next_step: "plan" },
       {
-        summary: "revised plan",
+        summary: "implemented revised solution",
         root_cause: "scope not aligned",
-        solution: "new staged design",
-        pr_url: "",
+        solution: "applied adjusted implementation",
+        pr_url: "https://github.com/acme/web/pull/172",
         test_cases: []
       }
     );
@@ -816,13 +989,12 @@ describe("IssueEngine", () => {
 
     await engine.runOnce();
 
-    expect(codex.triageRuns).toBe(1);
-    // plan mode uses implementation runner once to draft proposal
+    expect(codex.triageRuns).toBe(0);
     expect(codex.implementRuns).toBe(1);
     const record = await runtime.getRecord(issueKey);
-    expect(record?.state).toBe("awaiting_approval");
-    expect(record?.summary).toContain("needs revised plan");
-    expect(gh.comments.some((item) => item.includes("等待审批"))).toBe(true);
+    expect(record?.state).toBe("completed");
+    expect(record?.summary).toContain("implemented revised solution");
+    expect(codex.lastImplementUserMessage).toBe("我并不满意，方案请继续调整");
   });
 
   it("uses one shared codex session per issue and stores latest session id", async () => {
@@ -883,8 +1055,9 @@ describe("IssueEngine", () => {
 
     await engine.runOnce();
 
-    expect(codex.lastTriageResumeSessionId).toBe("implement-old");
-    expect(codex.lastImplementResumeSessionId).toBe("triage-new");
+    expect(codex.triageRuns).toBe(0);
+    expect(codex.lastTriageResumeSessionId).toBe("");
+    expect(codex.lastImplementResumeSessionId).toBe("implement-old");
 
     const record = await runtime.getRecord(issueKey);
     expect(record?.codexSessionId).toBe("implement-new");
@@ -892,7 +1065,138 @@ describe("IssueEngine", () => {
     expect(record?.implementSessionId).toBe("implement-new");
   });
 
-  it("re-triages completed issue when slack signal is pending", async () => {
+  it("reuses the same issue worktree metadata on new comments", async () => {
+    const repo = makeRepo("repo-a", "acme", "web");
+    const config = makeConfig([repo]);
+    const gh = new FakeGitHubClient({
+      number: 88,
+      title: "follow-up on same issue",
+      body: "please fix",
+      html_url: "https://github.com/acme/web/issues/88"
+    });
+
+    const runtime = new FakeRuntimeStore();
+    const codex = new FakeCodexRunner(
+      { needs_processing: true, reason: "valid bug" },
+      {
+        summary: "fixed",
+        root_cause: "missing guard",
+        solution: "add guard",
+        pr_url: "https://github.com/acme/web/pull/88",
+        test_cases: []
+      }
+    );
+    const observedExistingRecords: Array<IssueExecutionRecord | null | undefined> = [];
+
+    const engine = new IssueEngine({
+      getConfig: async () => config,
+      runtimeStore: runtime,
+      githubFactory: () => gh,
+      codexFactory: () => codex,
+      notifierFactory: () => null,
+      writeBoard: async () => undefined,
+      writeRegressionCase: async () => undefined,
+      prepareWorkspace: async (_repo, _issue, _comments, _imageUrls, existingRecord) => {
+        observedExistingRecords.push(existingRecord);
+        return {
+          contextFile: "/tmp/context.json",
+          worktreePath: "/tmp/worktrees/issue-88",
+          worktreeBranch: "issue-hunter/acme-web/88",
+          worktreeCreated: true,
+          cleanup: async () => undefined
+        };
+      }
+    });
+
+    await engine.runOnce();
+    gh.issueComments.push({ id: 9001, body: "new follow-up request", created_at: "2026-03-02T00:00:00.000Z" });
+    await engine.runOnce();
+
+    expect(observedExistingRecords[0]).toBeNull();
+    expect(observedExistingRecords[1]?.issueWorktreePath).toBe("/tmp/worktrees/issue-88");
+    expect(observedExistingRecords[1]?.issueWorktreeBranch).toBe("issue-hunter/acme-web/88");
+
+    const record = await runtime.getRecord("acme/web#88");
+    expect(record?.issueWorktreePath).toBe("/tmp/worktrees/issue-88");
+    expect(record?.issueWorktreeBranch).toBe("issue-hunter/acme-web/88");
+    expect(codex.implementRuns).toBe(2);
+  });
+
+  it("cleans issue worktree automatically after issue is closed", async () => {
+    const repo = makeRepo("repo-a", "acme", "web");
+    const config = makeConfig([repo]);
+    const gh = new FakeGitHubClient({
+      number: 193,
+      title: "closed issue cleanup",
+      body: "already done",
+      state: "closed",
+      html_url: "https://github.com/acme/web/issues/193"
+    });
+    gh.openIssuesOverride = [];
+
+    const runtime = new FakeRuntimeStore();
+    const issueKey = "acme/web#193";
+    await runtime.markSeen(issueKey);
+    await runtime.saveRecord({
+      issueKey,
+      repoId: repo.id,
+      issueNumber: 193,
+      state: "completed",
+      summary: "done",
+      prUrl: "https://github.com/acme/web/pull/193",
+      rootCause: "",
+      solution: "",
+      closedAt: "",
+      threadTs: "",
+      issueWorktreePath: "/tmp/worktrees/issue-193",
+      issueWorktreeBranch: "issue-hunter/acme-web/193",
+      updatedAt: new Date().toISOString()
+    });
+
+    const calls: CommandCall[] = [];
+    const commandRunner = async (
+      command: string,
+      args: string[],
+      options?: { cwd?: string; input?: string }
+    ): Promise<CommandResult> => {
+      calls.push({ command, args, cwd: options?.cwd });
+      return { code: 0, stdout: "", stderr: "" };
+    };
+
+    const engine = new IssueEngine({
+      getConfig: async () => config,
+      runtimeStore: runtime,
+      githubFactory: () => gh,
+      codexFactory: () => new FakeCodexRunner({ needs_processing: false, reason: "skip" }, {}),
+      notifierFactory: () => null,
+      writeBoard: async () => undefined,
+      writeRegressionCase: async () => undefined,
+      commandRunner
+    });
+
+    await engine.runOnce();
+
+    expect(
+      calls.some(
+        (call) =>
+          call.command === "git" &&
+          call.args.join(" ").includes("worktree remove --force /tmp/worktrees/issue-193")
+      )
+    ).toBe(true);
+    expect(
+      calls.some(
+        (call) =>
+          call.command === "git" &&
+          call.args.join(" ").includes("branch -D issue-hunter/acme-web/193")
+      )
+    ).toBe(true);
+
+    const record = await runtime.getRecord(issueKey);
+    expect(record?.issueWorktreePath).toBe("");
+    expect(record?.issueWorktreeBranch).toBe("");
+  });
+
+  it("forwards pending slack signal directly to implementation", async () => {
     const repo = makeRepo("repo-a", "acme", "web");
     const config = makeConfig([repo]);
     const gh = new FakeGitHubClient({
@@ -925,7 +1229,13 @@ describe("IssueEngine", () => {
 
     const codex = new FakeCodexRunner(
       { needs_processing: false, reason: "verified from latest instruction" },
-      {}
+      {
+        summary: "checked again",
+        root_cause: "na",
+        solution: "handled slack follow-up",
+        pr_url: "https://github.com/acme/web/pull/771",
+        test_cases: []
+      }
     );
 
     const engine = new IssueEngine({
@@ -940,7 +1250,8 @@ describe("IssueEngine", () => {
     });
 
     await engine.runOnce();
-    expect(codex.triageRuns).toBe(1);
+    expect(codex.triageRuns).toBe(0);
+    expect(codex.implementRuns).toBe(1);
     const updated = await runtime.getRecord(issueKey);
     expect(updated?.lastHandledSlackSignalAt).toBe("2026-02-26T00:00:00.000Z");
   });
@@ -1156,5 +1467,204 @@ describe("IssueEngine", () => {
     expect(calls.some((call) => call.command === "gh" && call.args[0] === "pr" && call.args[1] === "create")).toBe(
       true
     );
+    expect(extractPrCreateBody(calls)).toContain("Closes #120");
+  });
+
+  it("requires a new PR when implementation returns a merged PR URL", async () => {
+    const repo = makeRepo("repo-a", "acme", "web");
+    const config = makeConfig([repo]);
+    const gh = new FakeGitHubClient({
+      number: 122,
+      title: "follow-up after merged pr",
+      body: "please continue",
+      html_url: "https://github.com/acme/web/issues/122"
+    });
+    const runtime = new FakeRuntimeStore();
+
+    const codex = new FakeCodexRunner(
+      { needs_processing: true, reason: "needs follow-up fix" },
+      {
+        summary: "done",
+        root_cause: "edge case after merge",
+        solution: "add more fixes",
+        pr_url: "https://github.com/acme/web/pull/109",
+        test_cases: []
+      }
+    );
+
+    const calls: CommandCall[] = [];
+    const commandRunner = async (
+      command: string,
+      args: string[],
+      options?: { cwd?: string; input?: string }
+    ): Promise<CommandResult> => {
+      calls.push({ command, args, cwd: options?.cwd });
+
+      if (command === "gh" && args[0] === "pr" && args[1] === "view") {
+        return {
+          code: 0,
+          stdout: JSON.stringify({
+            state: "CLOSED",
+            mergedAt: "2026-03-04T08:53:56Z",
+            url: "https://github.com/acme/web/pull/109"
+          }),
+          stderr: ""
+        };
+      }
+      if (command === "gh" && args[0] === "pr" && args[1] === "list") {
+        return { code: 0, stdout: "[]", stderr: "" };
+      }
+      if (command === "git" && args[0] === "status") {
+        return { code: 0, stdout: " M src/main.ts\n", stderr: "" };
+      }
+      if (command === "git" && args[0] === "add") {
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      if (command === "git" && args[0] === "commit") {
+        return { code: 0, stdout: "[issue-hunter/122 1234abc] test", stderr: "" };
+      }
+      if (command === "git" && args[0] === "push") {
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      if (command === "gh" && args[0] === "repo" && args[1] === "view") {
+        return { code: 0, stdout: "main\n", stderr: "" };
+      }
+      if (command === "git" && args[0] === "fetch") {
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      if (command === "git" && args[0] === "rev-list") {
+        return { code: 0, stdout: "1\n", stderr: "" };
+      }
+      if (command === "gh" && args[0] === "pr" && args[1] === "create") {
+        return { code: 0, stdout: "https://github.com/acme/web/pull/122\n", stderr: "" };
+      }
+
+      return { code: 0, stdout: "", stderr: "" };
+    };
+
+    const engine = new IssueEngine({
+      getConfig: async () => config,
+      runtimeStore: runtime,
+      githubFactory: () => gh,
+      codexFactory: () => codex,
+      notifierFactory: () => null,
+      writeBoard: async () => undefined,
+      writeRegressionCase: async () => undefined,
+      commandRunner,
+      prepareWorkspace: async () => ({
+        contextFile: "/tmp/context.json",
+        worktreePath: "/tmp/worktree",
+        worktreeBranch: "issue-hunter/acme-web/122-abcd",
+        worktreeCreated: true,
+        cleanup: async () => undefined
+      })
+    });
+
+    await engine.runOnce();
+
+    const completed = await runtime.listCompleted();
+    expect(completed).toHaveLength(1);
+    expect(completed[0].prUrl).toBe("https://github.com/acme/web/pull/122");
+    expect(
+      calls.some(
+        (call) =>
+          call.command === "gh" &&
+          call.args[0] === "pr" &&
+          call.args[1] === "view" &&
+          call.args.includes("https://github.com/acme/web/pull/109")
+      )
+    ).toBe(true);
+    expect(calls.some((call) => call.command === "gh" && call.args[0] === "pr" && call.args[1] === "create")).toBe(
+      true
+    );
+    expect(gh.comments.some((item) => item.includes("PR:\nhttps://github.com/acme/web/pull/122"))).toBe(true);
+  });
+
+  it("auto creates PR with Refs issue linkage when configured", async () => {
+    const repo = makeRepo("repo-a", "acme", "web");
+    repo.prIssueReferenceMode = "refs";
+    const config = makeConfig([repo]);
+    const gh = new FakeGitHubClient({
+      number: 121,
+      title: "missing pr url refs mode",
+      body: "fix this",
+      html_url: "https://github.com/acme/web/issues/121"
+    });
+    const runtime = new FakeRuntimeStore();
+
+    const codex = new FakeCodexRunner(
+      { needs_processing: true, reason: "valid bug" },
+      {
+        summary: "fixed",
+        root_cause: "missing guard",
+        solution: "add guard and test",
+        test_cases: []
+      }
+    );
+
+    const calls: CommandCall[] = [];
+    const commandRunner = async (
+      command: string,
+      args: string[],
+      options?: { cwd?: string; input?: string }
+    ): Promise<CommandResult> => {
+      calls.push({ command, args, cwd: options?.cwd });
+
+      if (command === "gh" && args[0] === "pr" && args[1] === "list") {
+        return { code: 0, stdout: "[]", stderr: "" };
+      }
+      if (command === "git" && args[0] === "status") {
+        return { code: 0, stdout: " M src/main.ts\n", stderr: "" };
+      }
+      if (command === "git" && args[0] === "add") {
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      if (command === "git" && args[0] === "commit") {
+        return { code: 0, stdout: "[issue-hunter/121 1234abc] test", stderr: "" };
+      }
+      if (command === "git" && args[0] === "push") {
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      if (command === "gh" && args[0] === "repo" && args[1] === "view") {
+        return { code: 0, stdout: "main\n", stderr: "" };
+      }
+      if (command === "git" && args[0] === "fetch") {
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      if (command === "git" && args[0] === "rev-list") {
+        return { code: 0, stdout: "1\n", stderr: "" };
+      }
+      if (command === "gh" && args[0] === "pr" && args[1] === "create") {
+        return { code: 0, stdout: "https://github.com/acme/web/pull/121\n", stderr: "" };
+      }
+
+      return { code: 0, stdout: "", stderr: "" };
+    };
+
+    const engine = new IssueEngine({
+      getConfig: async () => config,
+      runtimeStore: runtime,
+      githubFactory: () => gh,
+      codexFactory: () => codex,
+      notifierFactory: () => null,
+      writeBoard: async () => undefined,
+      writeRegressionCase: async () => undefined,
+      commandRunner,
+      prepareWorkspace: async () => ({
+        contextFile: "/tmp/context.json",
+        worktreePath: "/tmp/worktree",
+        worktreeBranch: "issue-hunter/acme-web/121-abcd",
+        worktreeCreated: true,
+        cleanup: async () => undefined
+      })
+    });
+
+    await engine.runOnce();
+
+    const completed = await runtime.listCompleted();
+    expect(completed).toHaveLength(1);
+    expect(completed[0].prUrl).toBe("https://github.com/acme/web/pull/121");
+    expect(extractPrCreateBody(calls)).toContain("Refs #121");
+    expect(extractPrCreateBody(calls)).not.toContain("Closes #121");
   });
 });

@@ -1,12 +1,10 @@
 import { describe, expect, it } from "vitest";
 
 import {
-  buildContextualImplementUserMessage,
   CodexRunner,
   parseImplementationFromOutput,
   parseJsonFromOutput,
-  parseTriageFromOutput,
-  shouldInjectContextIntoImplementMessage
+  parseTriageFromOutput
 } from "../src/core/codex-runner.js";
 
 describe("parseJsonFromOutput", () => {
@@ -140,6 +138,7 @@ describe("CodexRunner event relay", () => {
     expect(updates.some((line) => line.includes("Tool:"))).toBe(false);
     expect(updates.some((line) => line.includes("Assistant: 🧠 triage thinking"))).toBe(true);
     expect(updates.some((line) => line.includes("System: Codex 会话已启动"))).toBe(true);
+    expect(updates.some((line) => line.includes("session: ses_triage_1"))).toBe(true);
     expect(updates.some((line) => line.includes("Assistant: ## Decision"))).toBe(true);
     expect(updates.some((line) => line.includes("本轮处理完成"))).toBe(false);
   });
@@ -166,32 +165,6 @@ describe("CodexRunner implementation raw message", () => {
     );
 
     expect(result.summary).toBe(originalMessage);
-  });
-
-  it("injects issue context when codex implement command misses context placeholder", () => {
-    const command = "codex exec --json --cd \"{worktree}\" {implement_user_message}";
-    expect(shouldInjectContextIntoImplementMessage(command)).toBe(true);
-
-    const prompt = buildContextualImplementUserMessage(
-      "/tmp/context.json",
-      148,
-      "memory design discussion",
-      "我们能否一起来讨论下设计方案"
-    );
-
-    expect(prompt).toContain("GitHub issue #148");
-    expect(prompt).toContain("/tmp/context.json");
-    expect(prompt).toContain("讨论下设计方案");
-  });
-
-  it("does not inject issue context for non-codex custom implement commands", () => {
-    const command = "node scripts/runner.js {implement_user_message}";
-    expect(shouldInjectContextIntoImplementMessage(command)).toBe(false);
-  });
-
-  it("does not inject issue context when command already includes context_file placeholder", () => {
-    const command = "codex exec --json --cd \"{worktree}\" \"read {context_file}\" {implement_user_message}";
-    expect(shouldInjectContextIntoImplementMessage(command)).toBe(false);
   });
 
   it("captures codex session id from thread.started event in implementation", async () => {
