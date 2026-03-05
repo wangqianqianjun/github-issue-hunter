@@ -1,8 +1,11 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import { accessSync, constants as fsConstants, existsSync } from "node:fs";
+import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { delimiter, dirname, join, resolve } from "node:path";
 
 import type { AppConfig, RepositoryConfig } from "../types/config.js";
+import type { AgentBackend } from "../types/config.js";
+import { resolveAgentBinary } from "../clients/agent-detect.js";
 import { WorktreeManager } from "./worktree-manager.js";
 import type { ConfigStore } from "./config-store.js";
 import { runCommand, type CommandResult } from "../utils/run-command.js";
@@ -38,6 +41,8 @@ export interface ChannelMessageInput {
   repoIdHint?: string;
   codexSessionIdHint?: string;
   issueKeyHint?: string;
+  issueWorktreePathHint?: string;
+  issueWorktreeBranchHint?: string;
 }
 
 export interface ChannelMessageResult {
@@ -56,12 +61,14 @@ export class SlackChannelCodexManager {
   private readonly sessions = new Map<string, ChannelSession>();
   private readonly queues = new Map<string, Promise<void>>();
   private readonly runningByThread = new Map<string, ChildProcess>();
+  private readonly pendingByThread = new Map<string, number>();
   private sessionsLoaded = false;
 
   constructor(
     private readonly configStore: ConfigStore,
     private readonly sessionFilePath: string,
-    private readonly commandRunner: CommandRunner = runCommand
+    private readonly commandRunner: CommandRunner = runCommand,
+    private readonly codexBin: string = ""
   ) {}
 
   async handleMessage(input: ChannelMessageInput): Promise<ChannelMessageResult> {
@@ -89,21 +96,31 @@ export class SlackChannelCodexManager {
         ? findRepoById(config, input.repoIdHint)
         : findRepoBySlackChannel(config, input.channelId);
 
+    // eslint-disable-next-line no-console
+    console.info(
+      `[issue-hunter][channel_codex] inbound thread=${input.threadId} channel=${input.channelId} ` +
+        `existing_session=${existing?.codexSessionId || "-"} existing_issue=${existing?.issueKey || "-"} ` +
+        `hint_repo=${input.repoIdHint || "-"} hint_issue=${issueKeyHint || "-"} hint_session=${input.codexSessionIdHint || "-"} ` +
+        `resolved_repo=${repo ? `${repo.owner}/${repo.repo}` : "-"} text="${truncate(text, 180)}"`
+    );
+
     if (!repo) {
       return { accepted: false, message: "" };
     }
 
-    const wasBusy = this.runningByThread.has(input.threadId) || this.queues.has(input.threadId);
+    const pendingCount = this.pendingByThread.get(input.threadId) || 0;
+    const wasBusy = pendingCount > 0 || this.runningByThread.has(input.threadId) || this.queues.has(input.threadId);
+    const sessionHint = String(existing?.codexSessionId || input.codexSessionIdHint || "").trim();
     const enqueuePromise = this.enqueue(input.threadId, async () => {
-      await this.runCodexForMessage(repo, input);
+      await this.runCodexForMessage(repo, input, config.global.agentBackend);
     });
     void enqueuePromise;
 
     return {
       accepted: true,
       message: wasBusy
-        ? `已收到，已加入当前 thread 队列（仓库: ${repo.owner}/${repo.repo}）。`
-        : `已收到，开始在仓库 ${repo.owner}/${repo.repo} 处理中。`
+        ? `已收到，已加入当前 thread 队列（仓库: ${repo.owner}/${repo.repo}）。${formatSessionAckMessage(sessionHint)}`
+        : `已收到，开始在仓库 ${repo.owner}/${repo.repo} 处理中。${formatSessionAckMessage(sessionHint)}`
     };
   }
 
@@ -158,12 +175,44 @@ export class SlackChannelCodexManager {
     }
   }
 
+  getLoadSnapshot(): { runningTasks: number; queuedTasks: number } {
+    let queuedTasks = 0;
+    for (const [threadId, pendingCount] of this.pendingByThread.entries()) {
+      const normalizedPending = Math.max(0, Number(pendingCount) || 0);
+      if (normalizedPending <= 0) {
+        continue;
+      }
+      const running = this.runningByThread.has(threadId) ? 1 : 0;
+      queuedTasks += Math.max(0, normalizedPending - running);
+    }
+    return {
+      runningTasks: this.runningByThread.size,
+      queuedTasks
+    };
+  }
+
   private async enqueue(threadId: string, task: () => Promise<void>): Promise<void> {
+    this.pendingByThread.set(threadId, (this.pendingByThread.get(threadId) || 0) + 1);
     const previous = this.queues.get(threadId) ?? Promise.resolve();
     const next = previous
       .catch(() => undefined)
       .then(task)
+      .catch((error) => {
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[issue-hunter][channel_codex] queued task failed thread=${threadId} detail="${truncate(
+            error instanceof Error ? error.message : String(error),
+            220
+          )}"`
+        );
+      })
       .finally(() => {
+        const pending = Math.max(0, (this.pendingByThread.get(threadId) || 1) - 1);
+        if (pending > 0) {
+          this.pendingByThread.set(threadId, pending);
+        } else {
+          this.pendingByThread.delete(threadId);
+        }
         if (this.queues.get(threadId) === next) {
           this.queues.delete(threadId);
         }
@@ -172,23 +221,58 @@ export class SlackChannelCodexManager {
     await next;
   }
 
-  private async runCodexForMessage(repo: RepositoryConfig, input: ChannelMessageInput): Promise<void> {
+  private async runCodexForMessage(
+    repo: RepositoryConfig,
+    input: ChannelMessageInput,
+    backend: AgentBackend
+  ): Promise<void> {
     const session = await this.getOrCreateSession(
       repo,
       input.threadId,
       input.channelId,
       String(input.codexSessionIdHint || "").trim(),
-      String(input.issueKeyHint || "").trim()
+      String(input.issueKeyHint || "").trim(),
+      String(input.issueWorktreePathHint || "").trim(),
+      String(input.issueWorktreeBranchHint || "").trim()
+    );
+    await this.recoverSessionWorktreeIfMissing(
+      repo,
+      session,
+      String(input.issueWorktreePathHint || "").trim(),
+      String(input.issueWorktreeBranchHint || "").trim()
     );
     const batchIntervalMs =
       Math.max(5, Number(process.env.ISSUE_HUNTER_SLACK_BATCH_INTERVAL_SECONDS || 45)) * 1000;
     const postBatcher = createPostBatcher(input.post, batchIntervalMs);
-    const command = buildCodexCommand(session.worktreePath, session.codexSessionId, input.text, session.issueKey);
-
-    const child = spawn(command.bin, command.args, {
-      cwd: session.worktreePath,
-      stdio: ["ignore", "pipe", "pipe"]
-    });
+    const command = buildCodexCommand(
+      this.codexBin,
+      backend,
+      session.worktreePath,
+      session.codexSessionId,
+      input.text
+    );
+    // eslint-disable-next-line no-console
+    console.info(
+      `[issue-hunter][channel_codex] start thread=${input.threadId} issue=${session.issueKey || "-"} repo=${repo.owner}/${repo.repo} ` +
+        `session=${session.codexSessionId || "-"} worktree=${session.worktreePath} branch=${session.worktreeBranch} bin=${command.bin}`
+    );
+    let child: ChildProcess;
+    try {
+      child = spawn(command.bin, command.args, {
+        cwd: session.worktreePath,
+        stdio: ["ignore", "pipe", "pipe"]
+      });
+    } catch (error) {
+      const detail = formatLaunchFailure(error, command.bin, session.worktreePath);
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[issue-hunter][channel_codex] spawn_failed thread=${input.threadId} issue=${session.issueKey || "-"} ` +
+          `session=${session.codexSessionId || "-"} detail="${truncate(detail, 220)}"`
+      );
+      await postBatcher.push(`处理失败: ${detail}`, { immediate: true });
+      await postBatcher.stop();
+      return;
+    }
     this.runningByThread.set(input.threadId, child);
 
     let stdout = "";
@@ -215,6 +299,9 @@ export class SlackChannelCodexManager {
         const startedId = String(event.thread_id ?? event.threadId ?? "").trim();
         if (startedId) {
           sessionId = startedId;
+          await postBatcher.push(`System: Codex 会话已启动 (session: ${startedId})`, {
+            immediate: true
+          });
         }
         return;
       }
@@ -242,52 +329,137 @@ export class SlackChannelCodexManager {
       }
     };
 
-    child.stdout.on("data", (chunk) => {
-      const text = chunk.toString();
-      stdout += text;
-      lineBuffer += text;
-      let idx = lineBuffer.indexOf("\n");
-      while (idx >= 0) {
-        const line = lineBuffer.slice(0, idx);
-        lineBuffer = lineBuffer.slice(idx + 1);
-        void consumeLine(line);
-        idx = lineBuffer.indexOf("\n");
+    try {
+      const stdoutStream = child.stdout;
+      if (stdoutStream) {
+        stdoutStream.on("data", (chunk) => {
+          const text = chunk.toString();
+          stdout += text;
+          lineBuffer += text;
+          let idx = lineBuffer.indexOf("\n");
+          while (idx >= 0) {
+            const line = lineBuffer.slice(0, idx);
+            lineBuffer = lineBuffer.slice(idx + 1);
+            void consumeLine(line);
+            idx = lineBuffer.indexOf("\n");
+          }
+        });
       }
-    });
 
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk.toString();
-    });
+      const stderrStream = child.stderr;
+      if (stderrStream) {
+        stderrStream.on("data", (chunk) => {
+          stderr += chunk.toString();
+        });
+      }
 
-    const code = await new Promise<number>((resolve) => {
-      child.on("close", (exitCode) => {
-        resolve(exitCode ?? 1);
+      const code = await new Promise<number>((resolve, reject) => {
+        child.on("error", (error) => {
+          reject(error);
+        });
+        child.on("close", (exitCode) => {
+          resolve(exitCode ?? 1);
+        });
       });
-    });
 
-    this.runningByThread.delete(input.threadId);
+      if (lineBuffer.trim()) {
+        await consumeLine(lineBuffer);
+      }
 
-    if (lineBuffer.trim()) {
-      await consumeLine(lineBuffer);
-    }
+      if (sessionId && sessionId !== session.codexSessionId) {
+        session.codexSessionId = sessionId;
+        session.updatedAt = new Date().toISOString();
+        this.sessions.set(input.threadId, session);
+        await this.persistSessions();
+        // eslint-disable-next-line no-console
+        console.info(
+          `[issue-hunter][channel_codex] session_updated thread=${input.threadId} issue=${session.issueKey || "-"} ` +
+            `session=${session.codexSessionId}`
+        );
+      }
 
-    if (sessionId && sessionId !== session.codexSessionId) {
-      session.codexSessionId = sessionId;
-      session.updatedAt = new Date().toISOString();
-      this.sessions.set(input.threadId, session);
-      await this.persistSessions();
-    }
+      if (code !== 0) {
+        const detail = truncate(stderr || stdout || `exit=${code}`, 1200);
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[issue-hunter][channel_codex] failed thread=${input.threadId} issue=${session.issueKey || "-"} ` +
+            `session=${session.codexSessionId || "-"} exit=${code} detail="${truncate(detail, 220)}"`
+        );
+        await postBatcher.push(`处理失败: ${detail}`, { immediate: true });
+        return;
+      }
 
-    if (code !== 0) {
-      const detail = truncate(stderr || stdout || `exit=${code}`, 1200);
+      const finalText = lastAssistantMessage || extractLastNonEmptyLine(stdout) || "已完成，但未捕获可展示输出。";
+      // eslint-disable-next-line no-console
+      console.info(
+        `[issue-hunter][channel_codex] done thread=${input.threadId} issue=${session.issueKey || "-"} ` +
+          `session=${session.codexSessionId || "-"} final_preview="${truncate(finalText, 220)}"`
+      );
+      await postBatcher.push(finalText, { immediate: true });
+    } catch (error) {
+      const detail = formatLaunchFailure(error, command.bin, session.worktreePath);
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[issue-hunter][channel_codex] runtime_failed thread=${input.threadId} issue=${session.issueKey || "-"} ` +
+          `session=${session.codexSessionId || "-"} detail="${truncate(detail, 220)}"`
+      );
       await postBatcher.push(`处理失败: ${detail}`, { immediate: true });
+    } finally {
+      this.runningByThread.delete(input.threadId);
       await postBatcher.stop();
+    }
+  }
+
+  private async recoverSessionWorktreeIfMissing(
+    repo: RepositoryConfig,
+    session: ChannelSession,
+    issueWorktreePathHint: string,
+    issueWorktreeBranchHint: string
+  ): Promise<void> {
+    if (await isExistingDirectory(session.worktreePath)) {
       return;
     }
 
-    const finalText = lastAssistantMessage || extractLastNonEmptyLine(stdout) || "已完成，但未捕获可展示输出。";
-    await postBatcher.push(finalText, { immediate: true });
-    await postBatcher.stop();
+    const hintedPath = String(issueWorktreePathHint || "").trim();
+    if (hintedPath && (await isExistingDirectory(hintedPath))) {
+      session.worktreePath = hintedPath;
+      if (String(issueWorktreeBranchHint || "").trim()) {
+        session.worktreeBranch = String(issueWorktreeBranchHint || "").trim();
+      }
+      session.updatedAt = new Date().toISOString();
+      this.sessions.set(session.threadId, session);
+      await this.persistSessions();
+      // eslint-disable-next-line no-console
+      console.info(
+        `[issue-hunter][channel_codex] recover_worktree thread=${session.threadId} issue=${session.issueKey || "-"} ` +
+          `mode=hint worktree=${session.worktreePath} branch=${session.worktreeBranch}`
+      );
+      return;
+    }
+
+    const issueNumber = extractIssueNumberFromKey(session.issueKey) || Date.now();
+    const plan = this.worktreeManager.plan(repo.localPath, repo.id, issueNumber);
+    const addResult = await this.commandRunner(
+      "git",
+      ["-C", repo.localPath, "worktree", "add", "-b", plan.branch, plan.path, "HEAD"],
+      { cwd: repo.localPath }
+    );
+    if (addResult.code !== 0) {
+      throw new Error(
+        `恢复 worktree 失败: ${addResult.stderr || addResult.stdout || `git exit ${addResult.code}`}`
+      );
+    }
+
+    session.worktreePath = plan.path;
+    session.worktreeBranch = plan.branch;
+    session.updatedAt = new Date().toISOString();
+    this.sessions.set(session.threadId, session);
+    await this.persistSessions();
+    // eslint-disable-next-line no-console
+    console.info(
+      `[issue-hunter][channel_codex] recover_worktree thread=${session.threadId} issue=${session.issueKey || "-"} ` +
+        `mode=recreate worktree=${session.worktreePath} branch=${session.worktreeBranch}`
+    );
   }
 
   private async getOrCreateSession(
@@ -295,7 +467,9 @@ export class SlackChannelCodexManager {
     threadId: string,
     channelId: string,
     codexSessionIdHint: string,
-    issueKeyHint: string
+    issueKeyHint: string,
+    issueWorktreePathHint: string,
+    issueWorktreeBranchHint: string
   ): Promise<ChannelSession> {
     const existing = this.sessions.get(threadId);
     if (existing && existing.repoId === repo.id) {
@@ -305,31 +479,64 @@ export class SlackChannelCodexManager {
         throw new Error(`Thread ${threadId} is already bound to ${boundIssueKey}; cannot switch to ${normalizedIssueKeyHint}`);
       }
       const hint = String(codexSessionIdHint || "").trim();
-      const shouldPersist = (!existing.codexSessionId && Boolean(hint)) || (!boundIssueKey && Boolean(normalizedIssueKeyHint));
+      const hintWorktreePath = String(issueWorktreePathHint || "").trim();
+      const hintWorktreeBranch = String(issueWorktreeBranchHint || "").trim();
+      const canRebindIssueWorktree =
+        Boolean(hintWorktreePath) &&
+        Boolean(normalizedIssueKeyHint) &&
+        (!boundIssueKey || boundIssueKey === normalizedIssueKeyHint) &&
+        existing.worktreePath !== hintWorktreePath &&
+        (await isExistingDirectory(hintWorktreePath));
+      const shouldPersist =
+        (!existing.codexSessionId && Boolean(hint)) ||
+        (!boundIssueKey && Boolean(normalizedIssueKeyHint)) ||
+        canRebindIssueWorktree;
       if (hint && !existing.codexSessionId) {
         existing.codexSessionId = hint;
       }
       if (!boundIssueKey && normalizedIssueKeyHint) {
         existing.issueKey = normalizedIssueKeyHint;
       }
+      if (canRebindIssueWorktree) {
+        existing.worktreePath = hintWorktreePath;
+        if (hintWorktreeBranch) {
+          existing.worktreeBranch = hintWorktreeBranch;
+        }
+      }
       if (shouldPersist) {
         existing.updatedAt = new Date().toISOString();
         this.sessions.set(threadId, existing);
         await this.persistSessions();
+        // eslint-disable-next-line no-console
+        console.info(
+          `[issue-hunter][channel_codex] rebind thread=${threadId} issue=${existing.issueKey || "-"} ` +
+            `session=${existing.codexSessionId || "-"} worktree=${existing.worktreePath} branch=${existing.worktreeBranch}`
+        );
       }
       return existing;
     }
 
-    const plan = this.worktreeManager.plan(repo.localPath, repo.id, Date.now());
-    const addResult = await this.commandRunner(
-      "git",
-      ["-C", repo.localPath, "worktree", "add", "-b", plan.branch, plan.path, "HEAD"],
-      { cwd: repo.localPath }
-    );
-    if (addResult.code !== 0) {
-      throw new Error(
-        `创建 worktree 失败: ${addResult.stderr || addResult.stdout || `git exit ${addResult.code}`}`
+    let worktreePath = "";
+    let worktreeBranch = "";
+    const hintedWorktreePath = String(issueWorktreePathHint || "").trim();
+    if (hintedWorktreePath && (await isExistingDirectory(hintedWorktreePath))) {
+      worktreePath = hintedWorktreePath;
+      worktreeBranch =
+        String(issueWorktreeBranchHint || "").trim() || `issue-hunter/${repo.id}/linked-${Date.now()}`;
+    } else {
+      const plan = this.worktreeManager.plan(repo.localPath, repo.id, Date.now());
+      const addResult = await this.commandRunner(
+        "git",
+        ["-C", repo.localPath, "worktree", "add", "-b", plan.branch, plan.path, "HEAD"],
+        { cwd: repo.localPath }
       );
+      if (addResult.code !== 0) {
+        throw new Error(
+          `创建 worktree 失败: ${addResult.stderr || addResult.stdout || `git exit ${addResult.code}`}`
+        );
+      }
+      worktreePath = plan.path;
+      worktreeBranch = plan.branch;
     }
 
     const session: ChannelSession = {
@@ -337,13 +544,18 @@ export class SlackChannelCodexManager {
       repoId: repo.id,
       channelId,
       issueKey: String(issueKeyHint || "").trim(),
-      worktreePath: plan.path,
-      worktreeBranch: plan.branch,
+      worktreePath,
+      worktreeBranch,
       codexSessionId: String(codexSessionIdHint || "").trim(),
       updatedAt: new Date().toISOString()
     };
     this.sessions.set(threadId, session);
     await this.persistSessions();
+    // eslint-disable-next-line no-console
+    console.info(
+      `[issue-hunter][channel_codex] create thread=${threadId} issue=${session.issueKey || "-"} repo=${repo.owner}/${repo.repo} ` +
+        `session=${session.codexSessionId || "-"} worktree=${session.worktreePath} branch=${session.worktreeBranch}`
+    );
     return session;
   }
 
@@ -495,10 +707,11 @@ function findRepoById(config: AppConfig, repoId: string): RepositoryConfig | nul
 }
 
 function buildCodexCommand(
+  codexBin: string,
+  backend: AgentBackend,
   worktreePath: string,
   sessionId: string,
-  text: string,
-  issueKey: string
+  text: string
 ): { bin: string; args: string[] } {
   const args = [
     "exec",
@@ -512,13 +725,9 @@ function buildCodexCommand(
   if (resume) {
     args.push("resume", resume);
   }
-  const guard = String(issueKey || "").trim()
-    ? `当前会话绑定 issue ${issueKey}。如果你的回答涉及其他 issue，请先指出冲突并停止执行。`
-    : "";
-  const finalText = [guard, String(text || "").trim()].filter(Boolean).join("\n\n");
-  args.push(finalText);
+  args.push(String(text ?? ""));
   return {
-    bin: process.env.ISSUE_HUNTER_CODEX_BIN || "codex",
+    bin: resolveCodexBinary(codexBin, backend),
     args
   };
 }
@@ -534,12 +743,90 @@ function extractLastNonEmptyLine(text: string): string {
   return lines[lines.length - 1];
 }
 
+function formatSessionAckMessage(sessionId: string): string {
+  const normalized = String(sessionId || "").trim();
+  if (normalized) {
+    return ` Codex Session: \`${normalized}\`（复用）。`;
+  }
+  return " Codex Session: 新会话创建中（启动后会回传 sessionId）。";
+}
+
 function truncate(text: string, maxLength: number): string {
   const value = String(text || "");
   if (value.length <= maxLength) {
     return value;
   }
   return `${value.slice(0, Math.max(0, maxLength - 3))}...`;
+}
+
+function formatLaunchFailure(error: unknown, commandBin: string, cwd?: string): string {
+  const detail = error instanceof Error ? error.message : String(error);
+  const code = String((error as { code?: unknown })?.code || "").trim();
+  if (code === "ENOENT") {
+    const normalizedCwd = String(cwd || "").trim();
+    if (normalizedCwd && !existsSync(normalizedCwd)) {
+      return `启动失败：工作目录不存在 "${normalizedCwd}"。该 thread 绑定的 worktree 可能已被清理，请重试后由系统自动重建。`;
+    }
+    if (!isCommandResolvable(commandBin)) {
+      const pathPreview = truncate(String(process.env.PATH || ""), 180);
+      return `未找到可执行命令 "${commandBin}"。请确认对应 CLI 已安装并在 PATH 中，或通过 ISSUE_HUNTER_CODEX_BIN / ISSUE_HUNTER_CLAUDE_BIN 指定绝对路径。PATH=${pathPreview || "(empty)"}`;
+    }
+    const pathPreview = truncate(String(process.env.PATH || ""), 180);
+    return `启动命令失败（ENOENT）。command="${commandBin}", cwd="${normalizedCwd || "-"}", PATH=${pathPreview || "(empty)"}`;
+  }
+  return detail;
+}
+
+function isCommandResolvable(commandBin: string): boolean {
+  const normalized = String(commandBin || "").trim();
+  if (!normalized) {
+    return false;
+  }
+
+  if (!normalized.includes("/") && !normalized.includes("\\")) {
+    const entries = String(process.env.PATH || "")
+      .split(delimiter)
+      .map((item) => String(item || "").trim())
+      .filter(Boolean);
+    for (const entry of entries) {
+      const candidate = join(entry, normalized);
+      try {
+        accessSync(candidate, fsConstants.X_OK);
+        return true;
+      } catch {
+        // continue
+      }
+    }
+    return false;
+  }
+
+  try {
+    accessSync(normalized, fsConstants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function resolveCodexBinary(codexBin: string, backend: AgentBackend): string {
+  const configured = String(codexBin || "").trim();
+  if (configured && configured.toLowerCase() !== "auto") {
+    return configured;
+  }
+  return resolveAgentBinary(backend);
+}
+
+export function resolveCodexBinaryForTest(codexBin: string, backend: AgentBackend = "codex"): string {
+  return resolveCodexBinary(codexBin, backend);
+}
+
+function extractIssueNumberFromKey(issueKey: string): number {
+  const match = String(issueKey || "").match(/#(\d+)\s*$/);
+  if (!match) {
+    return 0;
+  }
+  const value = Number(match[1]);
+  return Number.isFinite(value) && value > 0 ? value : 0;
 }
 
 function deriveThreadTokenAliases(token: string): string[] {
@@ -562,4 +849,17 @@ function deriveThreadTokenAliases(token: string): string[] {
     }
   }
   return [...aliases];
+}
+
+async function isExistingDirectory(path: string): Promise<boolean> {
+  const normalized = String(path || "").trim();
+  if (!normalized) {
+    return false;
+  }
+  try {
+    const stats = await stat(normalized);
+    return stats.isDirectory();
+  } catch {
+    return false;
+  }
 }
