@@ -8,7 +8,19 @@ export interface WorktreePlan {
 }
 
 export class WorktreeManager {
-  plan(repoLocalPath: string, repoId: string, issueNumber: number): WorktreePlan {
+  plan(
+    repoLocalPath: string,
+    repoId: string,
+    issueNumber: number,
+    preferredPath?: string,
+    preferredBranch?: string
+  ): WorktreePlan {
+    const normalizedPath = String(preferredPath || "").trim();
+    const normalizedBranch = String(preferredBranch || "").trim();
+    if (normalizedPath && normalizedBranch) {
+      return { branch: normalizedBranch, path: normalizedPath };
+    }
+
     const suffix = randomUUID().split("-")[0];
     const baseDir = join(repoLocalPath, ".worktrees");
     const branch = `issue-hunter/${repoId}/${issueNumber}-${suffix}`;

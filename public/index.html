@@ -27,13 +27,43 @@
         <pre id="service-status-json" class="mono-box"></pre>
       </section>
 
-      <nav class="tab-nav" aria-label="配置分区">
-        <button type="button" class="tab-btn active" data-tab="issue">Issue Hunter</button>
-        <button type="button" class="tab-btn" data-tab="board">Board</button>
-        <button type="button" class="tab-btn" data-tab="slack">Slack</button>
+      <nav class="tab-nav" aria-label="配置分区" role="tablist">
+        <button
+          id="tab-btn-issue"
+          type="button"
+          class="tab-btn active"
+          data-tab="issue"
+          role="tab"
+          aria-selected="true"
+          aria-controls="tab-issue"
+        >
+          Issue Hunter
+        </button>
+        <button
+          id="tab-btn-board"
+          type="button"
+          class="tab-btn"
+          data-tab="board"
+          role="tab"
+          aria-selected="false"
+          aria-controls="tab-board"
+        >
+          Board
+        </button>
+        <button
+          id="tab-btn-slack"
+          type="button"
+          class="tab-btn"
+          data-tab="slack"
+          role="tab"
+          aria-selected="false"
+          aria-controls="tab-slack"
+        >
+          Slack
+        </button>
       </nav>
 
-      <section id="tab-issue" class="tab-content active">
+      <section id="tab-issue" class="tab-content active" role="tabpanel" aria-labelledby="tab-btn-issue">
         <section class="panel">
           <h2>快速配置说明</h2>
           <div class="guide-grid">
@@ -71,6 +101,16 @@
                 <input name="workspaceDir" type="text" required />
                 <small class="hint-text">保存运行状态、产物和日志。建议使用独立目录，例如 `/Users/you/github-issue-hunter`。</small>
               </label>
+              <label>AI Agent
+                <div class="inline-form">
+                  <select name="agentBackend">
+                    <option value="codex">Codex</option>
+                    <option value="claude">Claude Code</option>
+                  </select>
+                  <button id="btn-detect-agents" type="button" class="ghost">探测</button>
+                </div>
+                <small id="agent-detect-summary" class="hint-text">自动探测中...</small>
+              </label>
               <label class="checkbox"><input name="closeIssueOnDone" type="checkbox" />完成后自动关闭 issue</label>
               <label class="checkbox"><input name="keepWorktrees" type="checkbox" />保留 worktree（调试）</label>
               <label class="checkbox"><input name="planMode" type="checkbox" />启用 Plan 模式（先出方案，审批后实现）</label>
@@ -95,6 +135,14 @@
                 </div>
                 <small class="hint-text">识别后自动生成仓库 ID 并绑定 owner/repo。</small>
               </label>
+              <label>Media Repo（owner/repo）
+                <input name="mediaRepo" type="text" placeholder="acme/web" />
+                <small class="hint-text">Issue 评论图片上传目标仓库。默认使用当前仓库。</small>
+              </label>
+              <label>Media Branch
+                <input name="mediaBranch" type="text" value="github-issue-hunter-media" />
+                <small class="hint-text">图片文件会提交到该分支，默认 `github-issue-hunter-media`。</small>
+              </label>
               <label>Triage Wording
                 <input name="triageWording" type="text" value="已经收到，正在分析" required />
                 <small class="hint-text">检测到新 issue 后立即回复的文案。</small>
@@ -106,6 +154,13 @@
               <label>Ignore Wording
                 <input name="ignoreWording" type="text" value="已经确认，目前没有计划支持" required />
                 <small class="hint-text">AI 判断暂不处理时回复的文案。</small>
+              </label>
+              <label>PR 关联策略
+                <select name="prIssueReferenceMode">
+                  <option value="close_keywords" selected>Closes/Fixes/Resolves（默认，自动关闭 Issue）</option>
+                  <option value="refs">Refs（仅关联，不自动关闭 Issue）</option>
+                </select>
+                <small class="hint-text">用于自动创建 PR 时尾部引用 issue 的文案策略。</small>
               </label>
               <label>仓库并发（同一仓库同时处理 issue 数）
                 <input name="perRepoConcurrency" type="number" min="1" value="1" required />
@@ -140,7 +195,7 @@
         </section>
       </section>
 
-      <section id="tab-slack" class="tab-content">
+      <section id="tab-slack" class="tab-content" role="tabpanel" aria-labelledby="tab-btn-slack">
         <section class="panel">
           <h2>Slack 配置向导</h2>
           <div class="wizard-overview">
@@ -269,7 +324,7 @@
         </section>
       </section>
 
-      <section id="tab-board" class="tab-content">
+      <section id="tab-board" class="tab-content" role="tabpanel" aria-labelledby="tab-btn-board">
         <section class="panel">
           <div class="panel-head">
             <h2>Issue 看板</h2>

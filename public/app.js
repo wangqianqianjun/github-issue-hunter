@@ -1,18 +1,20 @@
 const state = {
   config: null,
   status: null,
+  agentDetection: null,
   slackChannels: [],
   slackChannelsLoadedToken: "",
   boardItems: [],
   activeBoardItem: null,
-  activeBoardRequestId: 0
+  activeBoardRequestId: 0,
+  boardLastFocusedElement: null
 };
 
-const DEFAULT_TRIAGE_COMMAND = "codex triage --context {context_file}";
-const DEFAULT_IMPLEMENT_COMMAND = "codex implement --context {context_file}";
 const DEFAULT_TRIAGE_WORDING = "已经收到，正在分析";
 const DEFAULT_IMPLEMENT_WORDING = "已经确认，正在处理";
 const DEFAULT_IGNORE_WORDING = "已经确认，目前没有计划支持";
+const DEFAULT_PR_ISSUE_REFERENCE_MODE = "close_keywords";
+const DEFAULT_MEDIA_BRANCH = "github-issue-hunter-media";
 
 const els = {
   globalForm: document.getElementById("global-form"),
@@ -29,6 +31,7 @@ const els = {
   slackAuthResult: document.getElementById("slack-auth-result"),
   slackAppNameView: document.getElementById("slack-app-name-view"),
   webhookBaseUrlHint: document.getElementById("webhook-base-url-hint"),
+  agentDetectSummary: document.getElementById("agent-detect-summary"),
   boardCount: document.getElementById("board-count"),
   boardProcessingCount: document.getElementById("board-processing-count"),
   boardCompletedCount: document.getElementById("board-completed-count"),
@@ -70,6 +73,7 @@ function bindEvents() {
   document.getElementById("btn-stop").addEventListener("click", () => callServiceAction("stop"));
   document.getElementById("btn-run-once").addEventListener("click", () => callServiceAction("run-once"));
   document.getElementById("btn-refresh").addEventListener("click", () => refreshAll());
+  document.getElementById("btn-detect-agents").addEventListener("click", () => loadAgentDetection({ silent: false }));
   els.boardRefresh.addEventListener("click", () => loadBoard());
 
   document.getElementById("btn-manifest").addEventListener("click", () => loadManifest());
@@ -85,8 +89,9 @@ function bindEvents() {
       closeBoardDetail();
     }
   });
+  els.boardModal.addEventListener("keydown", (event) => handleBoardModalKeydown(event));
   document.addEventListener("keydown", (event) => {
-    if (event.key === "Escape") {
+    if (event.key === "Escape" && !els.boardModal.classList.contains("hidden")) {
       closeBoardDetail();
     }
   });
@@ -105,6 +110,7 @@ function bindEvents() {
         pollIntervalSeconds: Number(form.get("pollIntervalSeconds")),
         globalConcurrency: Number(form.get("globalConcurrency")),
         workspaceDir: String(form.get("workspaceDir") || ""),
+        agentBackend: String(form.get("agentBackend") || "codex"),
         closeIssueOnDone: Boolean(form.get("closeIssueOnDone")),
         keepWorktrees: Boolean(form.get("keepWorktrees")),
         planMode: Boolean(form.get("planMode"))
@@ -151,30 +157,37 @@ function bindEvents() {
 
     const owner = detected.owner;
     const repo = detected.repo;
-    const id = String(form.get("id") || "").trim() || `${owner}-${repo}`;
+    const defaultMediaRepo = `${owner}/${repo}`;
+    const id = String(form.get("id") || "").trim() || buildRepositoryId(owner, repo);
     const existing = (state.config?.repositories || []).find((item) => item.id === id);
     const slack = existing?.slack ?? {
       enabled: false,
       channelId: "",
       transport: "none"
     };
-    const triageCommand = String(existing?.triageCommand || DEFAULT_TRIAGE_COMMAND);
-    const implementCommand = String(existing?.implementCommand || DEFAULT_IMPLEMENT_COMMAND);
-
-    await saveRepository({
+    const payload = {
       id,
       owner,
       repo,
       localPath,
-      triageCommand,
-      implementCommand,
+      mediaRepo: normalizeMediaRepoInput(String(form.get("mediaRepo") || ""), defaultMediaRepo),
+      mediaBranch: String(form.get("mediaBranch") || "").trim() || DEFAULT_MEDIA_BRANCH,
       triageWording: String(form.get("triageWording") || DEFAULT_TRIAGE_WORDING),
       implementWording: String(form.get("implementWording") || DEFAULT_IMPLEMENT_WORDING),
       ignoreWording: String(form.get("ignoreWording") || DEFAULT_IGNORE_WORDING),
+      prIssueReferenceMode: String(form.get("prIssueReferenceMode") || DEFAULT_PR_ISSUE_REFERENCE_MODE),
       enabled: Boolean(form.get("enabled")),
       perRepoConcurrency: Number(form.get("perRepoConcurrency") || 1),
       slack
-    });
+    };
+    if (existing?.triageCommand) {
+      payload.triageCommand = String(existing.triageCommand);
+    }
+    if (existing?.implementCommand) {
+      payload.implementCommand = String(existing.implementCommand);
+    }
+
+    await saveRepository(payload);
 
     resetRepoForm();
     await refreshAll();
@@ -182,7 +195,7 @@ function bindEvents() {
 }
 
 async function refreshAll() {
-  await Promise.all([loadConfig(), loadStatus(), loadBoard()]);
+  await Promise.all([loadConfig(), loadStatus(), loadBoard(), loadAgentDetection({ silent: true })]);
 }
 
 async function loadConfig() {
@@ -212,9 +225,45 @@ function fillGlobalForm() {
   setInput(els.globalForm, "pollIntervalSeconds", global.pollIntervalSeconds);
   setInput(els.globalForm, "globalConcurrency", global.globalConcurrency);
   setInput(els.globalForm, "workspaceDir", global.workspaceDir);
+  setInput(els.globalForm, "agentBackend", global.agentBackend || "codex");
   setCheckbox(els.globalForm, "closeIssueOnDone", global.closeIssueOnDone);
   setCheckbox(els.globalForm, "keepWorktrees", global.keepWorktrees);
   setCheckbox(els.globalForm, "planMode", global.planMode);
+}
+
+async function loadAgentDetection(options = { silent: true }) {
+  try {
+    const detected = await jsonFetch("/api/agents/detect");
+    state.agentDetection = detected;
+    renderAgentDetectionSummary();
+  } catch (error) {
+    if (!options.silent) {
+      alert(`探测 Agent 失败: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (els.agentDetectSummary) {
+      els.agentDetectSummary.textContent = "自动探测失败，请检查本机 CLI 安装。";
+    }
+  }
+}
+
+function renderAgentDetectionSummary() {
+  if (!els.agentDetectSummary) {
+    return;
+  }
+  const detected = state.agentDetection;
+  if (!detected) {
+    els.agentDetectSummary.textContent = "自动探测中...";
+    return;
+  }
+
+  const codexLabel = detected.codex?.found
+    ? `Codex: ✅ ${detected.codex.path || "found"}`
+    : "Codex: ❌ not found";
+  const claudeLabel = detected.claude?.found
+    ? `Claude: ✅ ${detected.claude.path || "found"}`
+    : "Claude: ❌ not found";
+  const recommended = detected.recommendedBackend || "codex";
+  els.agentDetectSummary.textContent = `${codexLabel} | ${claudeLabel} | 默认推荐: ${recommended}`;
 }
 
 function fillSlackForm() {
@@ -256,7 +305,7 @@ function renderRepoTable() {
       if (!confirm(`确认删除仓库 ${repo.id} ?`)) {
         return;
       }
-      await jsonFetch(`/api/repositories/${repo.id}`, { method: "DELETE" });
+      await jsonFetch(`/api/repositories/${encodeURIComponent(repo.id)}`, { method: "DELETE" });
       await refreshAll();
     });
 
@@ -335,9 +384,12 @@ function fillRepoForm(repo) {
   setInput(els.repoForm, "id", repo.id);
   setInput(els.repoForm, "detectedRepo", `${repo.owner}/${repo.repo}`);
   setInput(els.repoForm, "localPath", repo.localPath);
+  setInput(els.repoForm, "mediaRepo", repo.mediaRepo || `${repo.owner}/${repo.repo}`);
+  setInput(els.repoForm, "mediaBranch", repo.mediaBranch || DEFAULT_MEDIA_BRANCH);
   setInput(els.repoForm, "triageWording", repo.triageWording || DEFAULT_TRIAGE_WORDING);
   setInput(els.repoForm, "implementWording", repo.implementWording || DEFAULT_IMPLEMENT_WORDING);
   setInput(els.repoForm, "ignoreWording", repo.ignoreWording || DEFAULT_IGNORE_WORDING);
+  setInput(els.repoForm, "prIssueReferenceMode", repo.prIssueReferenceMode || DEFAULT_PR_ISSUE_REFERENCE_MODE);
   setInput(els.repoForm, "perRepoConcurrency", repo.perRepoConcurrency);
   setCheckbox(els.repoForm, "enabled", repo.enabled);
 }
@@ -346,9 +398,12 @@ function resetRepoForm() {
   els.repoForm.reset();
   setInput(els.repoForm, "id", "");
   setInput(els.repoForm, "detectedRepo", "");
+  setInput(els.repoForm, "mediaRepo", "");
+  setInput(els.repoForm, "mediaBranch", DEFAULT_MEDIA_BRANCH);
   setInput(els.repoForm, "triageWording", DEFAULT_TRIAGE_WORDING);
   setInput(els.repoForm, "implementWording", DEFAULT_IMPLEMENT_WORDING);
   setInput(els.repoForm, "ignoreWording", DEFAULT_IGNORE_WORDING);
+  setInput(els.repoForm, "prIssueReferenceMode", DEFAULT_PR_ISSUE_REFERENCE_MODE);
   setInput(els.repoForm, "perRepoConcurrency", 1);
 }
 
@@ -578,9 +633,13 @@ async function openBoardDetail(item) {
   const requestId = state.activeBoardRequestId + 1;
   state.activeBoardRequestId = requestId;
   state.activeBoardItem = item;
+  state.boardLastFocusedElement = document.activeElement instanceof HTMLElement ? document.activeElement : null;
   renderBoardDetailLoading(item);
   els.boardModal.classList.remove("hidden");
   document.body.classList.add("modal-open");
+  window.requestAnimationFrame(() => {
+    els.boardClose?.focus();
+  });
 
   try {
     const detailRes = await jsonFetch(`/api/board/${encodeURIComponent(item.repoId)}/${item.issueNumber}`);
@@ -717,6 +776,38 @@ function closeBoardDetail() {
   state.activeBoardRequestId += 1;
   els.boardModal.classList.add("hidden");
   document.body.classList.remove("modal-open");
+  if (state.boardLastFocusedElement instanceof HTMLElement) {
+    state.boardLastFocusedElement.focus();
+  }
+  state.boardLastFocusedElement = null;
+}
+
+function handleBoardModalKeydown(event) {
+  if (els.boardModal.classList.contains("hidden")) {
+    return;
+  }
+  if (event.key !== "Tab") {
+    return;
+  }
+
+  const focusables = getFocusableElements(els.boardModal);
+  if (!focusables.length) {
+    event.preventDefault();
+    return;
+  }
+
+  const first = focusables[0];
+  const last = focusables[focusables.length - 1];
+  const current = document.activeElement;
+  if (event.shiftKey && current === first) {
+    event.preventDefault();
+    last.focus();
+    return;
+  }
+  if (!event.shiftKey && current === last) {
+    event.preventDefault();
+    first.focus();
+  }
 }
 
 function renderMarkdownToElement(element, markdown, html = "") {
@@ -736,10 +827,135 @@ function sanitizeHtmlFragment(html) {
   if (!value) {
     return "";
   }
-  return value
-    .replace(/<script[\s\S]*?>[\s\S]*?<\/script>/gi, "")
-    .replace(/\son[a-z]+\s*=\s*"[^"]*"/gi, "")
-    .replace(/\son[a-z]+\s*=\s*'[^']*'/gi, "");
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(`<div>${value}</div>`, "text/html");
+  const root = doc.body.firstElementChild;
+  if (!root) {
+    return "";
+  }
+
+  const blockedTags = new Set([
+    "script",
+    "style",
+    "iframe",
+    "object",
+    "embed",
+    "link",
+    "meta",
+    "form",
+    "input",
+    "button",
+    "select",
+    "textarea",
+    "svg",
+    "math"
+  ]);
+
+  const sanitizeNode = (node) => {
+    if (!(node instanceof Element)) {
+      return;
+    }
+    const tag = node.tagName.toLowerCase();
+    if (blockedTags.has(tag)) {
+      node.remove();
+      return;
+    }
+
+    for (const attr of Array.from(node.attributes)) {
+      const name = attr.name.toLowerCase();
+      const rawValue = String(attr.value || "").trim();
+      if (name.startsWith("on") || name === "style") {
+        node.removeAttribute(attr.name);
+        continue;
+      }
+
+      if (name === "href") {
+        if (!isSafeHtmlUrl(rawValue, true)) {
+          node.removeAttribute(attr.name);
+        }
+        continue;
+      }
+
+      if (name === "src") {
+        if (!isSafeHtmlUrl(rawValue, false)) {
+          node.removeAttribute(attr.name);
+        }
+        continue;
+      }
+
+      if (name === "target") {
+        if (rawValue !== "_blank") {
+          node.removeAttribute(attr.name);
+        }
+        continue;
+      }
+
+      if (name === "rel") {
+        node.removeAttribute(attr.name);
+        continue;
+      }
+
+      if (name === "class") {
+        if (tag === "code") {
+          const allowed = rawValue
+            .split(/\s+/)
+            .filter((item) => /^language-[a-z0-9_-]+$/i.test(item));
+          if (allowed.length) {
+            node.setAttribute("class", allowed.join(" "));
+          } else {
+            node.removeAttribute(attr.name);
+          }
+        } else {
+          node.removeAttribute(attr.name);
+        }
+        continue;
+      }
+
+      const commonAllowed = new Set(["title", "aria-label"]);
+      const imgAllowed = new Set(["alt", "width", "height"]);
+      if (commonAllowed.has(name)) {
+        continue;
+      }
+      if (tag === "img" && imgAllowed.has(name)) {
+        continue;
+      }
+      node.removeAttribute(attr.name);
+    }
+
+    if (tag === "a" && node.getAttribute("target") === "_blank") {
+      node.setAttribute("rel", "noreferrer noopener");
+    }
+
+    for (const child of Array.from(node.children)) {
+      sanitizeNode(child);
+    }
+  };
+
+  sanitizeNode(root);
+  return root.innerHTML.trim();
+}
+
+function isSafeHtmlUrl(raw, allowMailto) {
+  const value = String(raw || "").trim();
+  if (!value) {
+    return false;
+  }
+  if (value.startsWith("#") || value.startsWith("/")) {
+    return true;
+  }
+  try {
+    const parsed = new URL(value, window.location.origin);
+    const protocol = parsed.protocol.toLowerCase();
+    if (protocol === "http:" || protocol === "https:") {
+      return true;
+    }
+    if (allowMailto && protocol === "mailto:") {
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
 }
 
 function simpleMarkdownToHtml(markdown) {
@@ -827,6 +1043,17 @@ function renderInlineMarkdown(text) {
     return `<code>${escapeHtml(code)}</code>`;
   });
   return html;
+}
+
+function normalizeMediaRepoInput(value, fallback) {
+  const candidate = String(value || "").trim();
+  if (!candidate) {
+    return fallback;
+  }
+  if (!/^[^/\s]+\/[^/\s]+$/.test(candidate)) {
+    return fallback;
+  }
+  return candidate;
 }
 
 function restoreCodeBlocks(html, blocks) {
@@ -971,6 +1198,41 @@ function formatDisplayTime(value) {
   });
 }
 
+function buildRepositoryId(owner, repo) {
+  const normalizedOwner = String(owner || "").trim();
+  const normalizedRepo = String(repo || "").trim();
+  const slugBase = `${normalizedOwner}-${normalizedRepo}`
+    .replace(/[^a-zA-Z0-9._-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "")
+    .toLowerCase();
+  const hashSource = `${normalizedOwner}/${normalizedRepo}`.toLowerCase();
+  let hash = 2166136261;
+  for (const char of hashSource) {
+    hash ^= char.charCodeAt(0);
+    hash += (hash << 1) + (hash << 4) + (hash << 7) + (hash << 8) + (hash << 24);
+  }
+  const hashText = (hash >>> 0).toString(16).padStart(8, "0");
+  return `${slugBase || "repo"}-${hashText}`;
+}
+
+function getFocusableElements(container) {
+  if (!(container instanceof HTMLElement)) {
+    return [];
+  }
+  const selectors = [
+    "a[href]",
+    "button:not([disabled])",
+    "input:not([disabled])",
+    "select:not([disabled])",
+    "textarea:not([disabled])",
+    "[tabindex]:not([tabindex='-1'])"
+  ];
+  return Array.from(container.querySelectorAll(selectors.join(","))).filter((item) => {
+    return item instanceof HTMLElement && !item.hasAttribute("hidden") && item.tabIndex !== -1;
+  });
+}
+
 function bindTabEvents() {
   const hash = window.location.hash;
   const hashTab = hash === "#slack" ? "slack" : hash === "#board" ? "board" : "issue";
@@ -988,11 +1250,14 @@ function activateTab(tab, updateHash = true) {
   els.tabButtons.forEach((button) => {
     const isActive = button.dataset.tab === tab;
     button.classList.toggle("active", isActive);
+    button.setAttribute("aria-selected", isActive ? "true" : "false");
+    button.setAttribute("tabindex", isActive ? "0" : "-1");
   });
 
   els.tabContents.forEach((section) => {
     const isActive = section.id === `tab-${tab}`;
     section.classList.toggle("active", isActive);
+    section.hidden = !isActive;
   });
 
   if (updateHash) {

@@ -206,7 +206,8 @@ const makeConfig = (repositories: RepositoryConfig[]): AppConfig => ({
     workspaceDir: ".",
     closeIssueOnDone: true,
     keepWorktrees: false,
-    planMode: false
+    planMode: false,
+    agentBackend: "codex"
   },
   slackApp: {
     enabled: false,

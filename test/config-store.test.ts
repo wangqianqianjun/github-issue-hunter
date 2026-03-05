@@ -8,6 +8,7 @@ import {
   DEFAULT_IGNORE_WORDING,
   DEFAULT_IMPLEMENT_COMMAND,
   DEFAULT_IMPLEMENT_WORDING,
+  DEFAULT_PR_ISSUE_REFERENCE_MODE,
   DEFAULT_TRIAGE_COMMAND,
   DEFAULT_TRIAGE_WORDING
 } from "../src/core/defaults.js";
@@ -22,6 +23,7 @@ describe("ConfigStore", () => {
     expect(config.repositories).toEqual([]);
     expect(config.global.pollIntervalSeconds).toBe(30);
     expect(config.global.planMode).toBe(true);
+    expect(["codex", "claude"]).toContain(config.global.agentBackend);
   });
 
   it("upserts repository with local path and commands", async () => {
@@ -50,7 +52,39 @@ describe("ConfigStore", () => {
     const config = await store.load();
     expect(config.repositories).toHaveLength(1);
     expect(config.repositories[0].repo).toBe("web");
+    expect(config.repositories[0].mediaRepo).toBe("acme/web");
+    expect(config.repositories[0].mediaBranch).toBe("github-issue-hunter-media");
     expect(config.repositories[0].slack.transport).toBe("chat_sdk");
+    expect(config.repositories[0].prIssueReferenceMode).toBe(DEFAULT_PR_ISSUE_REFERENCE_MODE);
+  });
+
+  it("persists repository PR issue reference mode", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hunter-config-"));
+    const store = new ConfigStore(join(dir, "config.json"));
+
+    await store.upsertRepository({
+      id: "repo-pr-link-mode",
+      owner: "acme",
+      repo: "web",
+      localPath: "/tmp/acme-web",
+      triageCommand: DEFAULT_TRIAGE_COMMAND,
+      implementCommand: DEFAULT_IMPLEMENT_COMMAND,
+      triageWording: DEFAULT_TRIAGE_WORDING,
+      implementWording: DEFAULT_IMPLEMENT_WORDING,
+      ignoreWording: DEFAULT_IGNORE_WORDING,
+      prIssueReferenceMode: "refs",
+      enabled: true,
+      perRepoConcurrency: 1,
+      slack: {
+        enabled: false,
+        channelId: "",
+        transport: "none"
+      }
+    });
+
+    const config = await store.load();
+    expect(config.repositories).toHaveLength(1);
+    expect(config.repositories[0].prIssueReferenceMode).toBe("refs");
   });
 
   it("migrates legacy codex triage/implement subcommands to codex exec defaults", async () => {

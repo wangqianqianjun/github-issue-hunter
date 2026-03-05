@@ -7,6 +7,7 @@ import {
   buildSocketEventDedupKey,
   extractSocketModeInboundMessage,
   isHumanSocketModeEvent,
+  isStatusCommand,
   isStopCommand,
   loadThreadSubscriptions,
   normalizePostedSlackThreadId,
@@ -30,6 +31,20 @@ describe("ChatSlackBridge helpers", () => {
     expect(isStopCommand("请 stop 当前任务")).toBe(true);
     expect(isStopCommand("cancel now")).toBe(true);
     expect(isStopCommand("status")).toBe(false);
+  });
+
+  it("treats status as a strict command instead of substring matching", () => {
+    expect(isStatusCommand("status")).toBe(true);
+    expect(isStatusCommand("/status")).toBe(true);
+    expect(isStatusCommand("状态")).toBe(true);
+    expect(isStatusCommand("运行状态？")).toBe(true);
+    expect(isStatusCommand("<@U999> status")).toBe(true);
+    expect(
+      isStatusCommand(
+        '看起来并没有修复。elasticsearch request failed: 400 Bad Request: {"error":{"root_cause":[],"status":400}}'
+      )
+    ).toBe(false);
+    expect(isStatusCommand("请给我 status")).toBe(false);
   });
 
   it("persists and reloads concrete slack thread subscriptions", async () => {
@@ -77,7 +92,8 @@ describe("ChatSlackBridge helpers", () => {
       threadId: "slack:C777:1772222222.111111",
       channelId: "C777",
       text: "继续处理一下",
-      isMention: false
+      isMention: false,
+      isThreadReply: true
     });
   });
 
@@ -93,7 +109,8 @@ describe("ChatSlackBridge helpers", () => {
       threadId: "slack:C777:1772222333.222222",
       channelId: "C777",
       text: "<@U999> status",
-      isMention: true
+      isMention: true,
+      isThreadReply: false
     });
   });
 
@@ -115,7 +132,8 @@ describe("ChatSlackBridge helpers", () => {
       threadId: "slack:C888:1772999999.999999",
       channelId: "C888",
       text: "我在 thread 里回复一下",
-      isMention: false
+      isMention: false,
+      isThreadReply: true
     });
   });
 

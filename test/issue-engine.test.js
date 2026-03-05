@@ -87,7 +87,8 @@ const makeConfig = (repositories) => ({
         globalConcurrency: 2,
         workspaceDir: ".",
         closeIssueOnDone: true,
-        keepWorktrees: false
+        keepWorktrees: false,
+        agentBackend: "codex"
     },
     slackApp: {
         enabled: false,

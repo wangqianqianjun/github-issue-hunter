@@ -1,4 +1,6 @@
 export type SlackTransport = "none" | "slack_sdk" | "chat_sdk";
+export type PrIssueReferenceMode = "close_keywords" | "refs";
+export type AgentBackend = "codex" | "claude";
 
 export interface RepositorySlackConfig {
   enabled: boolean;
@@ -11,11 +13,14 @@ export interface RepositoryConfig {
   owner: string;
   repo: string;
   localPath: string;
+  mediaRepo?: string;
+  mediaBranch?: string;
   triageCommand: string;
   implementCommand: string;
   triageWording: string;
   implementWording: string;
   ignoreWording: string;
+  prIssueReferenceMode?: PrIssueReferenceMode;
   enabled: boolean;
   perRepoConcurrency: number;
   slack: RepositorySlackConfig;
@@ -28,6 +33,7 @@ export interface GlobalConfig {
   closeIssueOnDone: boolean;
   keepWorktrees: boolean;
   planMode: boolean;
+  agentBackend: AgentBackend;
 }
 
 export interface SlackAppConfig {
@@ -90,6 +96,8 @@ export interface IssueExecutionRecord {
   codexSessionId?: string;
   triageSessionId?: string;
   implementSessionId?: string;
+  issueWorktreePath?: string;
+  issueWorktreeBranch?: string;
   lastTriggerType?: "new" | "retry_failed" | "new_comment" | "slack_signal" | "approval" | "manual" | "stale_recovery";
   failureCategory?: "transient" | "logic" | "config" | "cancelled" | "unknown";
   failureRetryEligible?: boolean;

@@ -8,6 +8,7 @@ export interface CodexRunnerOptions {
   triageCommand: string;
   implementCommand: string;
   defaultWorkingDirectory: string;
+  agentBinary?: string;
 }
 
 export class CodexRunner implements CodexRunnerLike {
@@ -22,7 +23,7 @@ export class CodexRunner implements CodexRunnerLike {
     abortSignal?: AbortSignal,
     resumeSessionId?: string
   ): Promise<Record<string, unknown>> {
-    const commandTemplate = ensureResumeClausePlaceholder(this.options.triageCommand);
+    const commandTemplate = ensureAgentCliPlaceholder(ensureResumeClausePlaceholder(this.options.triageCommand));
     return runCodexCommand(
       commandTemplate,
       {
@@ -30,6 +31,7 @@ export class CodexRunner implements CodexRunnerLike {
         issue_number: String(issueNumber),
         issue_title: issueTitle,
         worktree: workingDirectory ?? this.options.defaultWorkingDirectory,
+        agent_cli: shellQuote(String(this.options.agentBinary || "codex").trim() || "codex"),
         resume_clause: buildResumeClause(resumeSessionId),
         resume_session: shellQuote(String(resumeSessionId || "").trim())
       },
@@ -50,7 +52,9 @@ export class CodexRunner implements CodexRunnerLike {
     abortSignal?: AbortSignal,
     resumeSessionId?: string
   ): Promise<Record<string, unknown>> {
-    const commandTemplate = ensureImplementUserMessagePlaceholder(ensureResumeClausePlaceholder(this.options.implementCommand));
+    const commandTemplate = ensureImplementUserMessagePlaceholder(
+      ensureAgentCliPlaceholder(ensureResumeClausePlaceholder(this.options.implementCommand))
+    );
     return runCodexCommand(
       commandTemplate,
       {
@@ -58,6 +62,7 @@ export class CodexRunner implements CodexRunnerLike {
         issue_number: String(issueNumber),
         issue_title: issueTitle,
         worktree: workingDirectory ?? this.options.defaultWorkingDirectory,
+        agent_cli: shellQuote(String(this.options.agentBinary || "codex").trim() || "codex"),
         implement_user_message: shellQuote(originalUserMessage),
         resume_clause: buildResumeClause(resumeSessionId),
         resume_session: shellQuote(String(resumeSessionId || "").trim())
@@ -704,6 +709,20 @@ function ensureResumeClausePlaceholder(template: string): string {
     return withCd;
   }
   return `${text} {resume_clause}`;
+}
+
+function ensureAgentCliPlaceholder(template: string): string {
+  const text = String(template || "").trim();
+  if (!text) {
+    return "{agent_cli} exec";
+  }
+  if (text.includes("{agent_cli}")) {
+    return text;
+  }
+  if (/^[^\s]+\s+exec\b/i.test(text)) {
+    return text.replace(/^[^\s]+(?=\s+exec\b)/i, "{agent_cli}");
+  }
+  return text;
 }
 
 function buildResumeClause(resumeSessionId?: string): string {

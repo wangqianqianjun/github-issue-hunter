@@ -111,6 +111,12 @@ describe("API config endpoints", () => {
     expect(initial.status).toBe(200);
     expect(initial.body.repositories).toHaveLength(0);
 
+    const detectedAgents = await request(app).get("/api/agents/detect");
+    expect(detectedAgents.status).toBe(200);
+    expect(typeof detectedAgents.body.codex?.found).toBe("boolean");
+    expect(typeof detectedAgents.body.claude?.found).toBe("boolean");
+    expect(["codex", "claude"]).toContain(detectedAgents.body.recommendedBackend);
+
     const health = await request(app).get("/api/health");
     expect(health.status).toBe(200);
     expect(health.body.service.runOnceInFlight).toBe(false);
@@ -144,9 +150,36 @@ describe("API config endpoints", () => {
     expect(after.body.repositories).toHaveLength(1);
     expect(after.body.repositories[0].owner).toBe("acme");
     expect(after.body.repositories[0].repo).toBe("web");
+    expect(after.body.repositories[0].mediaRepo).toBe("acme/web");
+    expect(after.body.repositories[0].mediaBranch).toBe("github-issue-hunter-media");
     expect(after.body.repositories[0].triageWording).toBe(DEFAULT_TRIAGE_WORDING);
     expect(after.body.repositories[0].implementWording).toBe(DEFAULT_IMPLEMENT_WORDING);
     expect(after.body.repositories[0].ignoreWording).toBe(DEFAULT_IGNORE_WORDING);
+    expect(after.body.repositories[0].prIssueReferenceMode).toBe("close_keywords");
+
+    const upsertRefsMode = await request(app).post("/api/repositories").send({
+      id: "repo-1",
+      localPath: "/tmp/acme-web",
+      mediaRepo: "acme/shared-media",
+      mediaBranch: "custom-media",
+      triageCommand: "codex triage --context {context_file}",
+      implementCommand: "codex implement --context {context_file}",
+      prIssueReferenceMode: "refs",
+      enabled: true,
+      perRepoConcurrency: 1,
+      slack: {
+        enabled: true,
+        channelId: "C123",
+        transport: "chat_sdk"
+      }
+    });
+    expect(upsertRefsMode.status).toBe(200);
+
+    const afterRefsMode = await request(app).get("/api/config");
+    expect(afterRefsMode.status).toBe(200);
+    expect(afterRefsMode.body.repositories[0].prIssueReferenceMode).toBe("refs");
+    expect(afterRefsMode.body.repositories[0].mediaRepo).toBe("acme/shared-media");
+    expect(afterRefsMode.body.repositories[0].mediaBranch).toBe("custom-media");
 
     const auth = await request(app).post("/api/slack/auth-test").send({ botToken: "xoxb-valid-token" });
     expect(auth.status).toBe(200);

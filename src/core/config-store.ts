@@ -2,10 +2,13 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, resolve } from "node:path";
 
 import type { AppConfig, RepositoryConfig } from "../types/config.js";
+import { detectAvailableAgentClis, normalizeAgentBackend } from "../clients/agent-detect.js";
 import {
+  DEFAULT_MEDIA_BRANCH,
   DEFAULT_IGNORE_WORDING,
   DEFAULT_IMPLEMENT_COMMAND,
   DEFAULT_IMPLEMENT_WORDING,
+  DEFAULT_PR_ISSUE_REFERENCE_MODE,
   DEFAULT_TRIAGE_COMMAND,
   DEFAULT_TRIAGE_WORDING
 } from "./defaults.js";
@@ -18,7 +21,8 @@ const DEFAULT_CONFIG: AppConfig = {
     workspaceDir: ".",
     closeIssueOnDone: false,
     keepWorktrees: false,
-    planMode: true
+    planMode: true,
+    agentBackend: "codex"
   },
   slackApp: {
     enabled: false,
@@ -53,9 +57,20 @@ export class ConfigStore {
     try {
       const text = await readFile(this.filePath, "utf8");
       const parsed = JSON.parse(text) as AppConfig;
-      return normalizeConfig(parsed);
+      const normalized = normalizeConfig(parsed);
+      const explicitBackend = normalizeAgentBackend(parsed?.global?.agentBackend);
+      if (!explicitBackend) {
+        const detected = detectAvailableAgentClis();
+        if (normalized.global.agentBackend !== detected.recommendedBackend) {
+          normalized.global.agentBackend = detected.recommendedBackend;
+          await this.save(normalized);
+        }
+      }
+      return normalized;
     } catch {
       const normalized = normalizeConfig(undefined);
+      const detected = detectAvailableAgentClis();
+      normalized.global.agentBackend = detected.recommendedBackend;
       await this.save(normalized);
       return normalized;
     }
@@ -122,7 +137,10 @@ function normalizeConfig(config: AppConfig | undefined): AppConfig {
     repositories: (config?.repositories ?? []).map((repo) => normalizeRepository(repo)),
     global: {
       ...DEFAULT_CONFIG.global,
-      ...config?.global
+      ...config?.global,
+      agentBackend:
+        normalizeAgentBackend(config?.global?.agentBackend) ??
+        DEFAULT_CONFIG.global.agentBackend
     },
     slackApp: {
       ...DEFAULT_CONFIG.slackApp,
@@ -149,13 +167,25 @@ function normalizeConfig(config: AppConfig | undefined): AppConfig {
 }
 
 function normalizeRepository(repo: RepositoryConfig): RepositoryConfig {
+  const normalizedOwner = String(repo.owner || "").trim();
+  const normalizedRepo = String(repo.repo || "").trim();
+  const defaultMediaRepo = normalizedOwner && normalizedRepo ? `${normalizedOwner}/${normalizedRepo}` : "";
+  const normalizedMediaRepo = normalizeMediaRepo(repo.mediaRepo, defaultMediaRepo);
+  const normalizedMediaBranch = normalizeMediaBranch(repo.mediaBranch);
+
   return {
     ...repo,
+    mediaRepo: normalizedMediaRepo,
+    mediaBranch: normalizedMediaBranch,
     triageCommand: normalizeTriageCommand(repo.triageCommand),
     implementCommand: normalizeImplementCommand(repo.implementCommand),
     triageWording: String(repo.triageWording || DEFAULT_TRIAGE_WORDING),
     implementWording: String(repo.implementWording || DEFAULT_IMPLEMENT_WORDING),
     ignoreWording: String(repo.ignoreWording || DEFAULT_IGNORE_WORDING),
+    prIssueReferenceMode:
+      repo.prIssueReferenceMode === "refs" || repo.prIssueReferenceMode === "close_keywords"
+        ? repo.prIssueReferenceMode
+        : DEFAULT_PR_ISSUE_REFERENCE_MODE,
     enabled: Boolean(repo.enabled),
     perRepoConcurrency: Math.max(1, Number(repo.perRepoConcurrency || 1)),
     slack: {
@@ -164,6 +194,27 @@ function normalizeRepository(repo: RepositoryConfig): RepositoryConfig {
       transport: repo.slack?.transport ?? "none"
     }
   };
+}
+
+function normalizeMediaRepo(value: string | undefined, fallback: string): string {
+  const candidate = String(value || "").trim();
+  const normalizedFallback = String(fallback || "").trim();
+  if (!candidate) {
+    return normalizedFallback;
+  }
+  return isValidOwnerRepo(candidate) ? candidate : normalizedFallback;
+}
+
+function normalizeMediaBranch(value: string | undefined): string {
+  const candidate = String(value || "").trim();
+  if (!candidate) {
+    return DEFAULT_MEDIA_BRANCH;
+  }
+  return candidate;
+}
+
+function isValidOwnerRepo(value: string): boolean {
+  return /^[^/\s]+\/[^/\s]+$/.test(String(value || "").trim());
 }
 
 function normalizeTriageCommand(command: string): string {

@@ -44,6 +44,7 @@ export interface ChannelMessageProvider {
     channelId: string;
     text: string;
     isMention: boolean;
+    isThreadReply: boolean;
     post: (text: string) => Promise<void>;
   }): Promise<ChannelMessageResult>;
 }
@@ -213,8 +214,7 @@ export class ChatSlackBridge {
       if (await handleControlCommands(thread, message.text, false)) {
         return;
       }
-      const text = message.text.trim().toLowerCase();
-      if (text.includes("status")) {
+      if (isStatusCommand(message.text)) {
         const status = await this.statusProvider();
         await thread.post(
           `Issue Hunter status: running=${status.running}, activeTasks=${status.activeTasks}, queue=${status.queueLength}`
@@ -228,6 +228,7 @@ export class ChatSlackBridge {
           channelId: resolveChannelIdFromThreadId(thread.id),
           text: message.text,
           isMention: true,
+          isThreadReply: true,
           post: async (text: string) => {
             await thread.post(text);
           }
@@ -258,14 +259,14 @@ export class ChatSlackBridge {
       if (await handleControlCommands(thread, message.text, true)) {
         return;
       }
-      const text = message.text.trim().toLowerCase();
-      if (!text.includes("status")) {
+      if (!isStatusCommand(message.text)) {
         if (this.channelMessageProvider) {
           const channelResult = await this.channelMessageProvider({
             threadId: thread.id,
             channelId: resolveChannelIdFromThreadId(thread.id),
             text: message.text,
             isMention: false,
+            isThreadReply: true,
             post: async (text: string) => {
               await thread.post(text);
             }
@@ -303,8 +304,7 @@ export class ChatSlackBridge {
       if (await handleControlCommands(thread, message.text, true)) {
         return;
       }
-      const text = message.text.trim().toLowerCase();
-      if (text.includes("status")) {
+      if (isStatusCommand(message.text)) {
         const status = await this.statusProvider();
         await thread.post(
           `Issue Hunter status: running=${status.running}, activeTasks=${status.activeTasks}, queue=${status.queueLength}`
@@ -317,6 +317,7 @@ export class ChatSlackBridge {
           channelId: resolveChannelIdFromThreadId(thread.id),
           text: message.text,
           isMention: false,
+          isThreadReply: true,
           post: async (text: string) => {
             await thread.post(text);
           }
@@ -654,7 +655,7 @@ export class ChatSlackBridge {
       return;
     }
 
-    if (text.includes("status")) {
+    if (isStatusCommand(textRaw)) {
       void this.logSlackInfo(`[issue-hunter][slack] branch=status thread=${thread.id}`);
       const status = await this.statusProvider();
       await thread.post(
@@ -669,6 +670,7 @@ export class ChatSlackBridge {
         channelId: inbound.channelId,
         text: textRaw,
         isMention: inbound.isMention,
+        isThreadReply: inbound.isThreadReply,
         post: thread.post
       });
       if (channelResult.accepted) {
@@ -1007,9 +1009,20 @@ export function isStopCommand(text: string): boolean {
   return raw.includes("停止") || raw.includes("中止") || raw.includes("终止");
 }
 
+export function isStatusCommand(text: string): boolean {
+  const raw = String(text || "").trim().toLowerCase();
+  if (!raw) {
+    return false;
+  }
+
+  const withoutMentions = raw.replace(/<@[^>]+>/g, " ").trim();
+  const compact = withoutMentions.replace(/\s+/g, " ");
+  return /^\/?(status|状态|服务状态|运行状态)([?!？！。]?)$/.test(compact);
+}
+
 export function extractSocketModeInboundMessage(
   event: Record<string, unknown>
-): { threadId: string; channelId: string; text: string; isMention: boolean } | null {
+): { threadId: string; channelId: string; text: string; isMention: boolean; isThreadReply: boolean } | null {
   const type = String(event.type || "").trim();
   const isMention = type === "app_mention";
   if (type !== "message" && !isMention) {
@@ -1036,7 +1049,8 @@ export function extractSocketModeInboundMessage(
       threadId: `slack:${channel}:${threadTs}`,
       channelId: channel,
       text,
-      isMention
+      isMention,
+      isThreadReply: true
     };
   }
 
@@ -1055,7 +1069,8 @@ export function extractSocketModeInboundMessage(
     threadId: `slack:${channel}:${threadTs}`,
     channelId: channel,
     text,
-    isMention
+    isMention,
+    isThreadReply: Boolean(String(event.thread_ts || "").trim())
   };
 }
 

@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { execSync } from "node:child_process";
 
 import { WorkspaceManager } from "../src/core/workspace-manager.js";
 import type { RepositoryConfig } from "../src/types/config.js";
@@ -16,6 +17,7 @@ const makeRepo = (localPath: string): RepositoryConfig => ({
   triageWording: "已经收到，正在分析",
   implementWording: "已经确认，正在处理",
   ignoreWording: "已经确认，目前没有计划支持",
+  prIssueReferenceMode: "close_keywords",
   enabled: true,
   perRepoConcurrency: 1,
   slack: {
@@ -30,6 +32,12 @@ describe("WorkspaceManager", () => {
     const root = mkdtempSync(join(tmpdir(), "hunter-workspace-"));
     const repoRoot = join(root, "repo");
     mkdirSync(repoRoot, { recursive: true });
+    execSync(`git -C "${repoRoot}" init`, { stdio: "ignore" });
+    execSync(`git -C "${repoRoot}" config user.email "issue-hunter@example.com"`, { stdio: "ignore" });
+    execSync(`git -C "${repoRoot}" config user.name "Issue Hunter"`, { stdio: "ignore" });
+    writeFileSync(join(repoRoot, ".seed"), "seed\n", "utf8");
+    execSync(`git -C "${repoRoot}" add .`, { stdio: "ignore" });
+    execSync(`git -C "${repoRoot}" commit -m "seed"`, { stdio: "ignore" });
     const workspaceRoot = join(root, "workspace");
     const manager = new WorkspaceManager({
       workspaceRoot,

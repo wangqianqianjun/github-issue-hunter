@@ -2,15 +2,18 @@ import express, { type Request, type Response } from "express";
 import { z } from "zod";
 
 import { buildSlackManifest } from "../chat/slack-manifest.js";
+import { detectAvailableAgentClis, normalizeAgentBackend } from "../clients/agent-detect.js";
 import { ConfigStore } from "../core/config-store.js";
 import {
+  DEFAULT_MEDIA_BRANCH,
   DEFAULT_IGNORE_WORDING,
   DEFAULT_IMPLEMENT_COMMAND,
   DEFAULT_IMPLEMENT_WORDING,
+  DEFAULT_PR_ISSUE_REFERENCE_MODE,
   DEFAULT_TRIAGE_COMMAND,
   DEFAULT_TRIAGE_WORDING
 } from "../core/defaults.js";
-import type { RepositoryConfig, SlackAppConfig } from "../types/config.js";
+import type { AppConfig, RepositoryConfig, SlackAppConfig } from "../types/config.js";
 
 interface ServiceStatus {
   running: boolean;
@@ -66,11 +69,14 @@ const repositorySchema = z.object({
   owner: z.string().min(1).optional(),
   repo: z.string().min(1).optional(),
   localPath: z.string().min(1),
+  mediaRepo: z.string().optional(),
+  mediaBranch: z.string().optional(),
   triageCommand: z.string().min(1).optional(),
   implementCommand: z.string().min(1).optional(),
   triageWording: z.string().min(1).optional(),
   implementWording: z.string().min(1).optional(),
   ignoreWording: z.string().min(1).optional(),
+  prIssueReferenceMode: z.enum(["close_keywords", "refs"]).optional(),
   enabled: z.boolean(),
   perRepoConcurrency: z.number().int().min(1),
   slack: z.object({
@@ -97,6 +103,11 @@ export async function createApiApp(deps: ApiAppDeps) {
   app.get("/api/config", async (_req, res) => {
     const config = await deps.configStore.load();
     res.json(config);
+  });
+
+  app.get("/api/agents/detect", (_req, res) => {
+    const detected = detectAvailableAgentClis();
+    res.json(detected);
   });
 
   app.get("/api/health", async (_req, res) => {
@@ -169,11 +180,14 @@ export async function createApiApp(deps: ApiAppDeps) {
       id: parsed.data.id?.trim() || `${owner}-${repo}`,
       owner,
       repo,
+      mediaRepo: normalizeMediaRepo(parsed.data.mediaRepo, `${owner}/${repo}`),
+      mediaBranch: String(parsed.data.mediaBranch || "").trim() || DEFAULT_MEDIA_BRANCH,
       triageCommand: parsed.data.triageCommand?.trim() || DEFAULT_TRIAGE_COMMAND,
       implementCommand: parsed.data.implementCommand?.trim() || DEFAULT_IMPLEMENT_COMMAND,
       triageWording: parsed.data.triageWording?.trim() || DEFAULT_TRIAGE_WORDING,
       implementWording: parsed.data.implementWording?.trim() || DEFAULT_IMPLEMENT_WORDING,
-      ignoreWording: parsed.data.ignoreWording?.trim() || DEFAULT_IGNORE_WORDING
+      ignoreWording: parsed.data.ignoreWording?.trim() || DEFAULT_IGNORE_WORDING,
+      prIssueReferenceMode: parsed.data.prIssueReferenceMode || DEFAULT_PR_ISSUE_REFERENCE_MODE
     };
 
     await deps.configStore.upsertRepository(payload);
@@ -204,7 +218,16 @@ export async function createApiApp(deps: ApiAppDeps) {
   });
 
   app.put("/api/global", async (req, res) => {
-    await deps.configStore.updateGlobal(req.body ?? {});
+    const patch = { ...(req.body ?? {}) } as Record<string, unknown>;
+    if ("agentBackend" in patch) {
+      const normalized = normalizeAgentBackend(patch.agentBackend);
+      if (!normalized) {
+        res.status(400).json({ error: "agentBackend must be codex or claude" });
+        return;
+      }
+      patch.agentBackend = normalized;
+    }
+    await deps.configStore.updateGlobal(patch as Partial<AppConfig["global"]>);
     res.json({ ok: true });
   });
 
@@ -301,4 +324,12 @@ export async function createApiApp(deps: ApiAppDeps) {
   });
 
   return app;
+}
+
+function normalizeMediaRepo(value: string | undefined, fallback: string): string {
+  const candidate = String(value || "").trim();
+  if (!candidate) {
+    return fallback;
+  }
+  return /^[^/\s]+\/[^/\s]+$/.test(candidate) ? candidate : fallback;
 }

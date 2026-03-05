@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 
 describe("UI tabs", () => {
   const html = readFileSync(resolve(process.cwd(), "public/index.html"), "utf8");
+  const appJs = readFileSync(resolve(process.cwd(), "public/app.js"), "utf8");
 
   it("separates issue hunter, board, and slack into tabs", () => {
     expect(html).toContain('data-tab="issue"');
@@ -13,6 +14,9 @@ describe("UI tabs", () => {
     expect(html).toContain('id="tab-issue"');
     expect(html).toContain('id="tab-board"');
     expect(html).toContain('id="tab-slack"');
+    expect(html).toContain('role="tablist"');
+    expect(html).toContain('role="tab"');
+    expect(html).toContain('role="tabpanel"');
   });
 
   it("keeps repository form focused on local repo fields only", () => {
@@ -45,5 +49,10 @@ describe("UI tabs", () => {
     expect(html).not.toContain('id="btn-autofill-app"');
     expect(html).not.toContain('name="appDisplayName"');
     expect(html).not.toContain('name="botDisplayName"');
+  });
+
+  it("does not keep legacy codex triage/implement command defaults in UI script", () => {
+    expect(appJs).not.toContain("codex triage --context");
+    expect(appJs).not.toContain("codex implement --context");
   });
 });

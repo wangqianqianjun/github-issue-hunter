@@ -4,6 +4,7 @@ import { ConfigStore } from "../core/config-store.js";
 import { IssueEngine } from "../core/issue-engine.js";
 import { FileRuntimeStore } from "../core/runtime-store.js";
 import { GhCliClient } from "../clients/gh-cli-client.js";
+import { resolveAgentBinary } from "../clients/agent-detect.js";
 import { CodexRunner } from "../core/codex-runner.js";
 import { ChatSlackBridge } from "../chat/vercel-chat-bridge.js";
 import {
@@ -26,6 +27,9 @@ async function main(): Promise<void> {
     Math.max(10, Number(process.env.ISSUE_HUNTER_WORKER_HEARTBEAT_INTERVAL_SECONDS || 30)) * 1000;
 
   const configStore = new ConfigStore(args.configPath);
+  const initialConfig = await configStore.load();
+  const agentBackend = initialConfig.global.agentBackend;
+  const agentBinary = resolveAgentBinary(agentBackend);
   const stateRoot = resolve(dirname(args.configPath), "runtime");
   const runtimeStore = new FileRuntimeStore(join(stateRoot, "issues.json"));
   const regressionDir = join(stateRoot, "regression_cases");
@@ -53,17 +57,20 @@ async function main(): Promise<void> {
       new GhCliClient({
         owner: repo.owner,
         repo: repo.repo,
-        localPath: repo.localPath
+        localPath: repo.localPath,
+        mediaRepo: repo.mediaRepo,
+        mediaBranch: repo.mediaBranch
       }),
     codexFactory: (repo) =>
       new CodexRunner({
         triageCommand: repo.triageCommand,
         implementCommand: repo.implementCommand,
-        defaultWorkingDirectory: repo.localPath
+        defaultWorkingDirectory: repo.localPath,
+        agentBinary
       }),
     notifierFactory: createNotifierFactory(configStore, chatBridge),
-    prepareWorkspace: async (repo, issue, comments, imageUrls) =>
-      prepareWorkspaceWithConfig(configStore, repo, issue, comments, imageUrls),
+    prepareWorkspace: async (repo, issue, comments, imageUrls, existingRecord) =>
+      prepareWorkspaceWithConfig(configStore, repo, issue, comments, imageUrls, existingRecord),
     onThreadRegistered: async (issueKey, threadToken) => {
       process.send?.({
         type: "thread_registered",

@@ -6,3 +6,5 @@ export const DEFAULT_IMPLEMENT_COMMAND =
 export const DEFAULT_TRIAGE_WORDING = "已经收到，正在分析";
 export const DEFAULT_IMPLEMENT_WORDING = "已经确认，正在处理";
 export const DEFAULT_IGNORE_WORDING = "已经确认，目前没有计划支持";
+export const DEFAULT_PR_ISSUE_REFERENCE_MODE = "close_keywords" as const;
+export const DEFAULT_MEDIA_BRANCH = "github-issue-hunter-media";
